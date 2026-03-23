@@ -10,7 +10,7 @@
 | | | | ___  ___| |_ / ___|___ | | (_)___(_) ___  _ __
 | |_| |/ _ \/ __| __| |   / _ \| | | / __| |/ _ \| '_ \
 |  _  | (_) \__ \ |_| |__| (_) | | | \__ \ | (_) | | | |
-|_| |_|\___/|___/\__|\____\___/|_|_|_|___/_|\___/|_| |_|  v3.2.0 Go Edition
+|_| |_|\___/|___/\__|\____\___/|_|_|_|___/_|\___/|_| |_|
 ```
 
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat-square&logo=go)](https://golang.org)
@@ -871,12 +871,6 @@ import hostcollision "github.com/AbnerEarl/HostCollision"
 results, _ := hostcollision.Run(ipList, hostList)
 ```
 
----
-
-## 🙏 致谢
-
-- 原始项目：[pmiaowu/HostCollision](https://github.com/pmiaowu/HostCollision)（Java 版）
-- 本项目为 Go 语言重写版，在原版基础上新增了防封禁/WAF 绕过/代理池/库模式调用等企业级特性
 
 ---
 

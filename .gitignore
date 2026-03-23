@@ -1,6 +1,4 @@
 # 编译产物
-hostcollision
-hostcollision.exe
 *.exe
 
 # 运行结果文件

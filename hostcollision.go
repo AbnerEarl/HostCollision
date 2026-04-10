@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/AbnerEarl/HostCollision/pkg/collision"
 	"github.com/AbnerEarl/HostCollision/pkg/config"
@@ -224,6 +225,8 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 	config.SetInstance(cfg)
 	httpclient.ResetRateLimiter()
 	httpclient.ResetProxyPoolManager()
+	httpclient.ResetTransportPool()
+	collision.ResetWAFPool()
 
 	// 初始化速率限制器
 	httpclient.InitRateLimiter(cfg.AntiDetection.RateLimit)
@@ -281,7 +284,10 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 			close(done)
 		}()
 
+		// 使用 ticker 替代忙等待，每500ms检查一次进度，大幅降低CPU占用
+		ticker := time.NewTicker(500 * time.Millisecond)
 		go func() {
+			defer ticker.Stop()
 			var oldNum int64
 			for {
 				select {
@@ -289,7 +295,7 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 					currentNum := atomic.LoadInt64(&numOfRequest)
 					opts.OnProgress(currentNum, requestTotal)
 					return
-				default:
+				case <-ticker.C:
 					currentNum := atomic.LoadInt64(&numOfRequest)
 					if currentNum != oldNum {
 						oldNum = currentNum
@@ -350,6 +356,8 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 	config.SetInstance(cfg)
 	httpclient.ResetRateLimiter()
 	httpclient.ResetProxyPoolManager()
+	httpclient.ResetTransportPool()
+	collision.ResetWAFPool()
 
 	// 初始化速率限制器
 	httpclient.InitRateLimiter(cfg.AntiDetection.RateLimit)
@@ -401,6 +409,10 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 		close(done)
 	}()
 
+	// 使用 ticker 替代忙等待，每200ms检查一次新结果
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
 	callbackIndex := 0
 	for {
 		select {
@@ -421,8 +433,8 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 			}
 			return nil
 
-		default:
-			// 实时处理新结果
+		case <-ticker.C:
+			// 定时处理新结果（替代忙等待的 default 分支）
 			resultsMu.Lock()
 			for i := callbackIndex; i < len(internalResults); i++ {
 				callbackIndex++

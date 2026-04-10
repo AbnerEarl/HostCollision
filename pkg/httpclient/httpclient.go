@@ -19,6 +19,11 @@ import (
 	"github.com/AbnerEarl/HostCollision/pkg/helpers"
 )
 
+// ========== 常量定义 ==========
+
+// maxResponseBodySize 最大响应体读取大小（512KB），防止大页面导致内存爆炸
+const maxResponseBodySize = 512 * 1024
+
 // ========== User-Agent 随机池 ==========
 
 // userAgentPool 常见浏览器 User-Agent 池，涵盖 Chrome/Firefox/Safari/Edge 多平台多版本
@@ -66,6 +71,158 @@ const defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // GetRandomUA 从 UA 池中随机选取一个 User-Agent
 func GetRandomUA() string {
 	return userAgentPool[rand.Intn(len(userAgentPool))]
+}
+
+// ========== 请求指纹多样化（绕过WAF指纹检测）==========
+
+// acceptVariants Accept 头变体池
+// 不同浏览器发送的 Accept 头略有不同，随机选择可以分散WAF指纹
+var acceptVariants = []string{
+	"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+	"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+	"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+	"text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8",
+}
+
+// acceptLanguageVariants Accept-Language 头变体池
+var acceptLanguageVariants = []string{
+	"zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+	"en-US,en;q=0.9",
+	"en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+	"zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+	"en-GB,en;q=0.9,en-US;q=0.8",
+	"zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+	"ja,en-US;q=0.9,en;q=0.8",
+}
+
+// fakeIPPool 伪造源IP池（用于 X-Forwarded-For 等头部）
+// 使用常见的内网IP和CDN节点IP，让WAF认为请求来自可信来源
+var fakeIPPool = []string{
+	"127.0.0.1",
+	"10.0.0.1",
+	"10.10.10.1",
+	"172.16.0.1",
+	"172.16.1.1",
+	"192.168.0.1",
+	"192.168.1.1",
+	"192.168.1.100",
+	"100.64.0.1",
+	"169.254.169.254",
+}
+
+// getRandomFakeIP 获取随机伪造IP
+func getRandomFakeIP() string {
+	return fakeIPPool[rand.Intn(len(fakeIPPool))]
+}
+
+// getRandomAccept 获取随机 Accept 头
+func getRandomAccept() string {
+	return acceptVariants[rand.Intn(len(acceptVariants))]
+}
+
+// getRandomAcceptLanguage 获取随机 Accept-Language 头
+func getRandomAcceptLanguage() string {
+	return acceptLanguageVariants[rand.Intn(len(acceptLanguageVariants))]
+}
+
+// ========== HTTP 连接池管理器 ==========
+
+// TransportPool 按 IP+协议 维度复用 Transport，避免重复 TLS 握手
+// 同一个 IP+协议 的多次请求（不同Host头）可以复用底层TCP连接
+type TransportPool struct {
+	mu         sync.RWMutex
+	transports map[string]*http.Transport
+	cfg        *config.Config
+}
+
+var (
+	transportPool     *TransportPool
+	transportPoolOnce sync.Once
+)
+
+// GetTransportPool 获取连接池单例
+func GetTransportPool() *TransportPool {
+	transportPoolOnce.Do(func() {
+		transportPool = &TransportPool{
+			transports: make(map[string]*http.Transport),
+		}
+	})
+	return transportPool
+}
+
+// ResetTransportPool 重置连接池（库模式下多次调用时使用）
+func ResetTransportPool() {
+	if transportPool != nil {
+		transportPool.mu.Lock()
+		for _, t := range transportPool.transports {
+			t.CloseIdleConnections()
+		}
+		transportPool.mu.Unlock()
+	}
+	transportPoolOnce = sync.Once{}
+	transportPool = nil
+}
+
+// GetTransport 获取或创建指定 IP+协议 的 Transport
+// 同一个 IP 的不同 Host 请求共享同一个 Transport，实现连接复用
+func (tp *TransportPool) GetTransport(key string, cfg *config.Config) *http.Transport {
+	tp.mu.RLock()
+	t, ok := tp.transports[key]
+	tp.mu.RUnlock()
+	if ok {
+		return t
+	}
+
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	// 双重检查
+	if t, ok = tp.transports[key]; ok {
+		return t
+	}
+
+	t = &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		DialContext: (&net.Dialer{
+			Timeout:   time.Duration(cfg.HTTP.ConnectTimeout) * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: time.Duration(cfg.HTTP.ReadTimeout) * time.Second,
+		// 启用连接复用：同一个IP的不同Host请求可以复用TCP连接
+		DisableKeepAlives:   false,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	// 代理配置（代理池优先 > 单一代理）
+	if cfg.HTTP.ProxyPool.IsStart {
+		pm := GetProxyPoolManager()
+		if pm.Size() > 0 {
+			// 代理池模式：每次请求动态选择代理
+			t.Proxy = func(req *http.Request) (*url.URL, error) {
+				proxyAddr := pm.Next()
+				return url.Parse(proxyAddr)
+			}
+		}
+	} else if cfg.HTTP.Proxy.IsStart {
+		proxyStr := fmt.Sprintf("http://%s:%d", cfg.HTTP.Proxy.Host, cfg.HTTP.Proxy.Port)
+		if cfg.HTTP.Proxy.Username != "" {
+			proxyStr = fmt.Sprintf("http://%s:%s@%s:%d",
+				cfg.HTTP.Proxy.Username, cfg.HTTP.Proxy.Password,
+				cfg.HTTP.Proxy.Host, cfg.HTTP.Proxy.Port)
+		}
+		proxyURL, err := url.Parse(proxyStr)
+		if err == nil {
+			t.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	tp.transports[key] = t
+	return t
 }
 
 // ========== 代理池管理器 ==========
@@ -148,6 +305,13 @@ func InitRateLimiter(ratePerSecond int) {
 			tokens: make(chan struct{}, ratePerSecond),
 			stopCh: make(chan struct{}),
 		}
+		// 预填充令牌桶，避免启动时的冷启动延迟
+		for i := 0; i < ratePerSecond; i++ {
+			select {
+			case rl.tokens <- struct{}{}:
+			default:
+			}
+		}
 		go func() {
 			interval := time.Second / time.Duration(ratePerSecond)
 			ticker := time.NewTicker(interval)
@@ -225,32 +389,53 @@ type HttpCustomRequest struct {
 	Location      string // Location 头
 	ServerHeader  string // Server 头
 	XPoweredByVal string // X-Powered-By 头
+
+	// 缓存字段，避免重复计算
+	cachedAppBody      string
+	cachedBodyFormat   string
+	cachedTitle        string
+	appBodyComputed    bool
+	bodyFormatComputed bool
+	titleComputed      bool
 }
 
-// Title 获取网页标题
+// Title 获取网页标题（带缓存）
 func (r *HttpCustomRequest) Title() string {
-	return helpers.GetBodyTitle(r.AppBody())
+	if !r.titleComputed {
+		r.cachedTitle = helpers.GetBodyTitle(r.AppBody())
+		r.titleComputed = true
+	}
+	return r.cachedTitle
 }
 
-// AppBody 获取经过处理的响应体
+// AppBody 获取经过处理的响应体（带缓存）
 // 如果有 Location 跳转，提取其中的 URL 主机部分
 func (r *HttpCustomRequest) AppBody() string {
-	if r.Location != "" {
-		u, err := url.Parse(r.Location)
-		if err != nil {
-			return ""
+	if !r.appBodyComputed {
+		if r.Location != "" {
+			u, err := url.Parse(r.Location)
+			if err != nil {
+				r.cachedAppBody = ""
+			} else if u.Host != "" {
+				r.cachedAppBody = u.Scheme + "://" + u.Host
+			} else {
+				r.cachedAppBody = ""
+			}
+		} else {
+			r.cachedAppBody = r.Body
 		}
-		if u.Host != "" {
-			return u.Scheme + "://" + u.Host
-		}
-		return ""
+		r.appBodyComputed = true
 	}
-	return r.Body
+	return r.cachedAppBody
 }
 
-// BodyFormat 获取格式化后的响应体（替换掉host）
+// BodyFormat 获取格式化后的响应体（替换掉host）（带缓存）
 func (r *HttpCustomRequest) BodyFormat() string {
-	return strings.ReplaceAll(r.AppBody(), r.Host, "")
+	if !r.bodyFormatComputed {
+		r.cachedBodyFormat = strings.ReplaceAll(r.AppBody(), r.Host, "")
+		r.bodyFormatComputed = true
+	}
+	return r.cachedBodyFormat
 }
 
 // FilteredPageContent 获取过滤后的页面内容
@@ -261,7 +446,7 @@ func (r *HttpCustomRequest) FilteredPageContent() string {
 // ========== 核心 HTTP 请求函数 ==========
 
 // SendHTTPGetRequest 发送HTTP GET请求
-// 支持: UA 随机化、Header 伪造、代理池轮换、速率限制、延迟扫描
+// 支持: UA 随机化、Header 伪造、代理池轮换、速率限制、延迟扫描、连接池复用
 func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 	cfg := config.GetInstance()
 
@@ -286,40 +471,10 @@ func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 
 	targetURL := protocol + ip
 
-	// ===== 创建 Transport =====
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		DialContext: (&net.Dialer{
-			Timeout: time.Duration(cfg.HTTP.ConnectTimeout) * time.Second,
-		}).DialContext,
-		ResponseHeaderTimeout: time.Duration(cfg.HTTP.ReadTimeout) * time.Second,
-		DisableKeepAlives:     true,
-	}
-
-	// ===== 代理配置（代理池优先 > 单一代理）=====
-	if cfg.HTTP.ProxyPool.IsStart {
-		pm := GetProxyPoolManager()
-		if pm.Size() > 0 {
-			proxyAddr := pm.Next()
-			proxyURL, err := url.Parse(proxyAddr)
-			if err == nil {
-				transport.Proxy = http.ProxyURL(proxyURL)
-			}
-		}
-	} else if cfg.HTTP.Proxy.IsStart {
-		proxyStr := fmt.Sprintf("http://%s:%d", cfg.HTTP.Proxy.Host, cfg.HTTP.Proxy.Port)
-		if cfg.HTTP.Proxy.Username != "" {
-			proxyStr = fmt.Sprintf("http://%s:%s@%s:%d",
-				cfg.HTTP.Proxy.Username, cfg.HTTP.Proxy.Password,
-				cfg.HTTP.Proxy.Host, cfg.HTTP.Proxy.Port)
-		}
-		proxyURL, err := url.Parse(proxyStr)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-		}
-	}
+	// ===== 获取连接池中的 Transport（按 IP+协议 复用）=====
+	transportKey := protocol + ip
+	tp := GetTransportPool()
+	transport := tp.GetTransport(transportKey, cfg)
 
 	client := &http.Client{
 		Transport: transport,
@@ -334,22 +489,41 @@ func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
 
-	// ===== 设置请求头 =====
+	// ===== 设置请求头（多样化指纹，绕过WAF指纹检测）=====
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7")
+	if cfg.AntiDetection.RandomUA {
+		// 随机化 Accept 和 Accept-Language，分散请求指纹
+		req.Header.Set("Accept", getRandomAccept())
+		req.Header.Set("Accept-Language", getRandomAcceptLanguage())
+	} else {
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7")
+	}
 	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Set("Connection", "close")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	// 随机决定是否发送 Cache-Control（减少请求指纹一致性）
+	if rand.Intn(2) == 0 {
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+	} else {
+		req.Header.Set("Cache-Control", "max-age=0")
+	}
 
 	// ===== Header 伪造（Bypass WAF）=====
 	if cfg.AntiDetection.FakeHeaders.IsStart {
+		// 使用随机伪造IP替代固定IP，避免WAF识别固定模式
+		randomIP := getRandomFakeIP()
 		for key, value := range cfg.AntiDetection.FakeHeaders.Headers {
 			key = strings.TrimSpace(key)
 			value = strings.TrimSpace(value)
 			if key != "" && value != "" {
-				req.Header.Set(key, value)
+				// 对IP类头部使用随机IP
+				keyLower := strings.ToLower(key)
+				if strings.Contains(keyLower, "ip") || strings.Contains(keyLower, "forwarded") {
+					req.Header.Set(key, randomIP)
+				} else {
+					req.Header.Set(key, value)
+				}
 			}
 		}
 	}
@@ -365,10 +539,14 @@ func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// 限制响应体读取大小，防止大页面导致内存爆炸
+	limitedReader := io.LimitReader(resp.Body, maxResponseBodySize)
+	body, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
+	// 丢弃剩余数据以便连接可以被复用
+	io.Copy(io.Discard, resp.Body)
 
 	requestHost := host
 	if requestHost == "" {

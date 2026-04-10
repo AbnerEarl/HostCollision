@@ -141,17 +141,18 @@ func (r *Result) String() string {
 }
 
 // DefaultOptions 返回一套合理的默认配置选项
+// 默认参数已针对大数据量场景优化，在安全性和速度之间取得平衡
 func DefaultOptions() *Options {
 	return &Options{
 		Protocols:                  []string{"http://", "https://"},
-		Threads:                    6,
+		Threads:                    10,
 		OutputErrorLog:             false,
 		CollisionSuccessStatusCode: "200,301,302,404",
-		DataSampleNumber:           10,
+		DataSampleNumber:           5,
 		SimilarityRatio:            0.7,
-		RateLimit:                  50,
-		DelayMin:                   1000,
-		DelayMax:                   3000,
+		RateLimit:                  100,
+		DelayMin:                   200,
+		DelayMax:                   800,
 		RandomUA:                   true,
 		FakeHeaders:                true,
 		FakeHeadersMap: map[string]string{
@@ -227,6 +228,7 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 	httpclient.ResetProxyPoolManager()
 	httpclient.ResetTransportPool()
 	collision.ResetWAFPool()
+	collision.ResetSampleCache()
 
 	// 初始化速率限制器
 	httpclient.InitRateLimiter(cfg.AntiDetection.RateLimit)
@@ -243,6 +245,12 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 		threads = 1
 	}
 
+	// IP 预检测：快速过滤不可达的IP，避免后续大量无效请求
+	ipList = collision.PreCheckIPs(ipList, opts.Protocols, opts.OutputErrorLog)
+	if len(ipList) == 0 {
+		return nil, fmt.Errorf("所有IP均不可达")
+	}
+
 	// 请求计数器
 	var numOfRequest int64
 
@@ -253,12 +261,12 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 	// 总任务数
 	requestTotal := int64(len(ipList) * len(opts.Protocols) * len(hostList))
 
-	// IP 数据分块
-	ipChunks := helpers.ListChunkSplit(ipList, threads)
+	// 创建全局任务队列（替代IP分块，实现更均衡的负载分配）
+	taskQueue := collision.NewTaskQueue(ipList, opts.Protocols)
 
-	// 建立 goroutine 池
+	// 建立 goroutine 池（所有Worker从同一个队列竞争消费任务）
 	var wg sync.WaitGroup
-	for _, chunk := range ipChunks {
+	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		worker := collision.NewWorker(
 			cfg,
@@ -266,13 +274,13 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 			&internalResults,
 			&resultsMu,
 			opts.Protocols,
-			chunk,
+			nil, // 不再分配IP列表，从队列消费
 			hostList,
 			opts.OutputErrorLog,
 		)
 		go func() {
 			defer wg.Done()
-			worker.Run()
+			worker.RunFromQueue(taskQueue)
 		}()
 	}
 
@@ -358,6 +366,7 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 	httpclient.ResetProxyPoolManager()
 	httpclient.ResetTransportPool()
 	collision.ResetWAFPool()
+	collision.ResetSampleCache()
 
 	// 初始化速率限制器
 	httpclient.InitRateLimiter(cfg.AntiDetection.RateLimit)
@@ -373,6 +382,12 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 		threads = 1
 	}
 
+	// IP 预检测
+	ipList = collision.PreCheckIPs(ipList, opts.Protocols, opts.OutputErrorLog)
+	if len(ipList) == 0 {
+		return fmt.Errorf("所有IP均不可达")
+	}
+
 	var numOfRequest int64
 
 	// 使用带回调的包装结果列表
@@ -381,10 +396,11 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 
 	requestTotal := int64(len(ipList) * len(opts.Protocols) * len(hostList))
 
-	ipChunks := helpers.ListChunkSplit(ipList, threads)
+	// 创建全局任务队列
+	taskQueue := collision.NewTaskQueue(ipList, opts.Protocols)
 
 	var wg sync.WaitGroup
-	for _, chunk := range ipChunks {
+	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		worker := collision.NewWorker(
 			cfg,
@@ -392,13 +408,13 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 			&internalResults,
 			&resultsMu,
 			opts.Protocols,
-			chunk,
+			nil,
 			hostList,
 			opts.OutputErrorLog,
 		)
 		go func() {
 			defer wg.Done()
-			worker.Run()
+			worker.RunFromQueue(taskQueue)
 		}()
 	}
 

@@ -206,6 +206,152 @@ func (r *CollisionResult) SuccessLog() string {
 		r.Protocol, r.IP, r.Host, r.Title, r.MatchContentLen, r.MatchStatusCode)
 }
 
+// ========== 全局任务队列模型 ==========
+
+// CollisionTask 碰撞任务单元（IP+协议维度）
+type CollisionTask struct {
+	Protocol string
+	IP       string
+}
+
+// TaskQueue 全局任务队列，Worker 从中取任务，实现负载均衡
+type TaskQueue struct {
+	tasks chan CollisionTask
+}
+
+// NewTaskQueue 创建任务队列并填充任务
+// 将所有 IP×协议 组合打散后放入队列，Worker 竞争消费
+func NewTaskQueue(ipList []string, protocols []string) *TaskQueue {
+	tasks := make([]CollisionTask, 0, len(ipList)*len(protocols))
+	for _, ip := range ipList {
+		for _, protocol := range protocols {
+			tasks = append(tasks, CollisionTask{Protocol: protocol, IP: ip})
+		}
+	}
+	// 打散任务顺序，避免多个Worker同时请求同一个IP
+	rand.Shuffle(len(tasks), func(i, j int) {
+		tasks[i], tasks[j] = tasks[j], tasks[i]
+	})
+
+	ch := make(chan CollisionTask, len(tasks))
+	for _, t := range tasks {
+		ch <- t
+	}
+	close(ch)
+
+	return &TaskQueue{tasks: ch}
+}
+
+// PreCheckIPs 批量预检测IP可达性
+// 快速发送一个简单请求检测IP是否可达，过滤掉不可达的IP
+// 返回可达的IP列表
+func PreCheckIPs(ipList []string, protocols []string, outputErrorLog bool) []string {
+	type checkResult struct {
+		ip        string
+		reachable bool
+	}
+
+	var mu sync.Mutex
+	reachableSet := make(map[string]bool)
+	var wg sync.WaitGroup
+
+	// 并发检测，但限制并发数避免瞬间大量连接
+	sem := make(chan struct{}, 20)
+
+	for _, ip := range ipList {
+		for _, protocol := range protocols {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(p, i string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				_, err := httpclient.SendHTTPGetRequestQuick(p, i, "")
+				mu.Lock()
+				if err == nil {
+					reachableSet[i] = true
+				} else if outputErrorLog {
+					fmt.Printf("info: IP预检测 %s%s 不可达,将跳过: %v\n", p, i, err)
+				}
+				mu.Unlock()
+			}(protocol, ip)
+		}
+	}
+	wg.Wait()
+
+	var result []string
+	for _, ip := range ipList {
+		if reachableSet[ip] {
+			result = append(result, ip)
+		}
+	}
+
+	if outputErrorLog && len(ipList) != len(result) {
+		fmt.Printf("info: IP预检测完成, %d/%d 个IP可达\n", len(result), len(ipList))
+	}
+
+	return result
+}
+
+// ========== 数据样本共享缓存 ==========
+
+// dataSampleCache 数据样本缓存（按 IP+协议 维度共享）
+// 避免多个Worker重复生成同一个IP+协议的数据样本
+type dataSampleCache struct {
+	mu      sync.RWMutex
+	samples map[string][]*httpclient.HttpCustomRequest
+}
+
+var (
+	globalSampleCache *dataSampleCache
+	sampleCacheOnce   sync.Once
+)
+
+func getSampleCache() *dataSampleCache {
+	sampleCacheOnce.Do(func() {
+		globalSampleCache = &dataSampleCache{
+			samples: make(map[string][]*httpclient.HttpCustomRequest),
+		}
+	})
+	return globalSampleCache
+}
+
+// ResetSampleCache 重置样本缓存
+func ResetSampleCache() {
+	sampleCacheOnce = sync.Once{}
+	globalSampleCache = nil
+}
+
+// getOrCreateSamples 获取或创建数据样本（线程安全，只生成一次）
+func (c *dataSampleCache) getOrCreateSamples(key, protocol, ip, errorHost string, sampleNum int) []*httpclient.HttpCustomRequest {
+	// 快速路径：读锁检查
+	c.mu.RLock()
+	if samples, ok := c.samples[key]; ok {
+		c.mu.RUnlock()
+		return samples
+	}
+	c.mu.RUnlock()
+
+	// 慢路径：写锁创建
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 双重检查
+	if samples, ok := c.samples[key]; ok {
+		return samples
+	}
+
+	var samples []*httpclient.HttpCustomRequest
+	for i := 0; i < sampleNum; i++ {
+		sampleReq, err := httpclient.SendHTTPGetRequest(protocol, ip, errorHost)
+		if err == nil {
+			samples = append(samples, sampleReq)
+		}
+	}
+	c.samples[key] = samples
+	return samples
+}
+
 // ========== 碰撞工作器 ==========
 
 // Worker Host碰撞工作器
@@ -263,7 +409,7 @@ func (w *Worker) initCache() {
 	})
 }
 
-// Run 执行碰撞任务
+// Run 执行碰撞任务（传统模式：按分配的IP列表串行处理）
 func (w *Worker) Run() {
 	w.initCache()
 	for _, ip := range w.ipList {
@@ -273,11 +419,16 @@ func (w *Worker) Run() {
 	}
 }
 
+// RunFromQueue 从全局任务队列消费任务执行（推荐模式：负载均衡）
+func (w *Worker) RunFromQueue(queue *TaskQueue) {
+	w.initCache()
+	for task := range queue.tasks {
+		w.processIPProtocol(task.Protocol, task.IP)
+	}
+}
+
 // processIPProtocol 处理单个 IP + 协议的碰撞
 func (w *Worker) processIPProtocol(protocol, ip string) {
-	// 数据样本（同一个 ip + 协议 只生成一次）
-	var dataSample []*httpclient.HttpCustomRequest
-
 	// 获取该 IP+协议 的 WAF 追踪器
 	wafKey := protocol + ip
 	tracker := getWAFPool().getTracker(wafKey)
@@ -293,34 +444,26 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 	}
 
 	// WAF 预检测（软检测）：检查基准请求是否命中WAF特征
-	// 注意：这里不再直接放弃，而是记录WAF状态并调整策略
 	if w.isWAFBlocked(baseRequest) {
-		// 基准请求就被WAF拦截，说明该IP可能有全局WAF
-		// 记录拦截，获取退避建议
 		backoffMs, shouldGiveUp := tracker.recordBlock()
 		if shouldGiveUp {
-			// 连续大量拦截，确认为硬封，放弃
 			atomic.AddInt64(w.numOfRequest, int64(len(w.hostList)))
 			if w.outputErrorLog {
 				fmt.Printf("warning: 站点 %s 连续被WAF拦截超过阈值,放弃碰撞\n", protocol+ip)
 			}
 			return
 		}
-		// 退避等待后重试基准请求
 		if backoffMs > 0 {
 			if w.outputErrorLog {
 				fmt.Printf("info: 站点 %s 基准请求命中WAF特征,退避 %dms 后重试\n", protocol+ip, backoffMs)
 			}
 			time.Sleep(time.Duration(backoffMs) * time.Millisecond)
-			// 重试基准请求
 			baseRequest, err = httpclient.SendHTTPGetRequest(protocol, ip, "")
 			if err != nil {
 				atomic.AddInt64(w.numOfRequest, int64(len(w.hostList)))
 				return
 			}
-			// 重试后仍然被拦截
 			if w.isWAFBlocked(baseRequest) {
-				// 再次记录拦截
 				_, shouldGiveUp2 := tracker.recordBlock()
 				if shouldGiveUp2 {
 					atomic.AddInt64(w.numOfRequest, int64(len(w.hostList)))
@@ -329,7 +472,6 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 					}
 					return
 				}
-				// 即使基准被拦截，仍然尝试碰撞（因为不同Host可能有不同的WAF策略）
 				if w.outputErrorLog {
 					fmt.Printf("info: 站点 %s 基准请求被WAF拦截,但仍尝试碰撞(不同Host可能有不同策略)\n", protocol+ip)
 				}
@@ -365,15 +507,14 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 	_ = baseRequest.BodyFormat()
 	_ = errorHostRequest.BodyFormat()
 
-	// 打散 Host 列表顺序，避免按固定模式发送请求
-	// 这样可以降低被WAF基于请求模式识别的风险
+	// 打散 Host 列表顺序
 	shuffledHosts := make([]string, len(w.hostList))
 	copy(shuffledHosts, w.hostList)
 	rand.Shuffle(len(shuffledHosts), func(i, j int) {
 		shuffledHosts[i], shuffledHosts[j] = shuffledHosts[j], shuffledHosts[i]
 	})
 
-	// 重试队列：被WAF拦截的Host放入重试队列
+	// 重试队列
 	var retryQueue []string
 
 	for _, host := range shuffledHosts {
@@ -384,30 +525,26 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 			time.Sleep(waitDur)
 		}
 
-		result := w.collision(&dataSample, baseRequest, errorHostRequest, protocol, ip, host, tracker)
+		result := w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker)
 		if result == collisionResultWAFBlocked {
-			// 被WAF拦截，加入重试队列
 			retryQueue = append(retryQueue, host)
 		}
 	}
 
-	// 处理重试队列：等待一段时间后重试被WAF拦截的Host
+	// 处理重试队列
 	if len(retryQueue) > 0 && tracker.getState() != wafStateBlocked {
-		// 等待一个较长的退避时间
-		retryDelay := 5000 + rand.Intn(10000) // 5-15秒
+		retryDelay := 5000 + rand.Intn(10000)
 		if w.outputErrorLog {
 			fmt.Printf("info: 站点 %s 有 %d 个Host被WAF拦截,等待 %dms 后重试\n",
 				protocol+ip, len(retryQueue), retryDelay)
 		}
 		time.Sleep(time.Duration(retryDelay) * time.Millisecond)
 
-		// 重新打散重试队列
 		rand.Shuffle(len(retryQueue), func(i, j int) {
 			retryQueue[i], retryQueue[j] = retryQueue[j], retryQueue[i]
 		})
 
 		for _, host := range retryQueue {
-			// 检查是否已经被硬封
 			if tracker.getState() == wafStateBlocked {
 				if w.outputErrorLog {
 					fmt.Printf("warning: 站点 %s 重试期间被硬封,停止重试\n", protocol+ip)
@@ -415,16 +552,14 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 				break
 			}
 
-			// 检查退避
 			if waitDur := tracker.shouldWait(); waitDur > 0 {
 				time.Sleep(waitDur)
 			}
 
-			// 重试时增加额外的随机延迟（2-5秒），降低被检测风险
 			extraDelay := 2000 + rand.Intn(3000)
 			time.Sleep(time.Duration(extraDelay) * time.Millisecond)
 
-			w.collision(&dataSample, baseRequest, errorHostRequest, protocol, ip, host, tracker)
+			w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker)
 		}
 	}
 }
@@ -440,17 +575,11 @@ const (
 )
 
 // isWAFBlocked 检查请求是否被WAF拦截
-// 通过检查响应体和响应头中的WAF特征来判断
 func (w *Worker) isWAFBlocked(req *httpclient.HttpCustomRequest) bool {
-	// 检查常见的WAF拦截状态码
-	// 403 可能是正常的权限拒绝，但结合其他特征可以判断
-	// 429 是明确的频率限制
-	// 503 可能是WAF的挑战页面
 	if req.StatusCode == 429 {
 		return true
 	}
 
-	// 检查 Server 头
 	if s := req.ServerHeader; s != "" {
 		sLower := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(s, " ", "")))
 		for _, bl := range w.serviceBlacklists {
@@ -460,7 +589,6 @@ func (w *Worker) isWAFBlocked(req *httpclient.HttpCustomRequest) bool {
 		}
 	}
 
-	// 检查 X-Powered-By 头
 	if xp := req.XPoweredByVal; xp != "" {
 		xpLower := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(xp, " ", "")))
 		for _, bl := range w.xPoweredByBlacklists {
@@ -470,7 +598,6 @@ func (w *Worker) isWAFBlocked(req *httpclient.HttpCustomRequest) bool {
 		}
 	}
 
-	// 检查响应体中的WAF特征
 	if ab := req.AppBody(); ab != "" {
 		abLower := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(ab, " ", "")))
 		for _, bl := range w.bodyBlacklists {
@@ -489,8 +616,9 @@ func (w *Worker) isWAFBlocked(req *httpclient.HttpCustomRequest) bool {
 // 2. 延迟发送相对错误请求，只在通过初步检查后才发送
 // 3. 使用带阈值的相似度计算，提前终止不可能达标的计算
 // 4. WAF自适应退避：检测到WAF不放弃，而是退避后重试
+// 5. 使用共享数据样本缓存，避免重复生成
 func (w *Worker) collision(
-	dataSample *[]*httpclient.HttpCustomRequest,
+	sampleKey string,
 	baseRequest, errorHostRequest *httpclient.HttpCustomRequest,
 	protocol, ip, host string,
 	tracker *wafTracker,
@@ -505,7 +633,6 @@ func (w *Worker) collision(
 	}
 
 	// ===== WAF 实时检测 =====
-	// 每个碰撞请求都检测WAF，而不仅仅是基准请求
 	if w.isWAFBlocked(newRequest) {
 		backoffMs, shouldGiveUp := tracker.recordBlock()
 		if shouldGiveUp {
@@ -519,18 +646,16 @@ func (w *Worker) collision(
 				fmt.Printf("info: 协议:%s, ip:%s, host:%s 被WAF拦截,退避 %dms,加入重试队列\n",
 					protocol, ip, host, backoffMs)
 			}
-			// 退避等待
 			time.Sleep(time.Duration(backoffMs) * time.Millisecond)
 		}
 		return collisionResultWAFBlocked
 	}
 
-	// 请求未被WAF拦截，记录成功
 	tracker.recordSuccess()
 
 	// ===== 轻量级检查（不需要额外HTTP请求）=====
 
-	// HTTP 状态码检查（提前到最前面，避免无效的后续计算）
+	// HTTP 状态码检查
 	if !httpStatusCodeCheck(fmt.Sprintf("%d", newRequest.StatusCode), w.statusCodeWhitelist) {
 		if w.outputErrorLog {
 			fmt.Printf("协议:%s, ip:%s, host:%s, title:%s, 数据包大小:%d, 状态码:%d 不是白名单状态码,忽略处理\n",
@@ -539,7 +664,7 @@ func (w *Worker) collision(
 		return collisionResultFailed
 	}
 
-	// 请求长度初步检查（只检查碰撞请求本身）
+	// 请求长度初步检查
 	if newRequest.Location == "" && newRequest.ContentLen <= 0 {
 		if w.outputErrorLog {
 			fmt.Printf("协议:%s, ip:%s, host:%s 该请求长度为%d 有异常,不进行碰撞-2\n",
@@ -548,7 +673,7 @@ func (w *Worker) collision(
 		return collisionResultFailed
 	}
 
-	// 快速内容比对（与基准请求和错误请求比较，不需要额外HTTP请求）
+	// 快速内容比对
 	newBody := newRequest.AppBody()
 	baseBody := baseRequest.AppBody()
 	errorBody := errorHostRequest.AppBody()
@@ -571,7 +696,7 @@ func (w *Worker) collision(
 		}
 	}
 
-	// 快速 title 比对（与基准请求和错误请求比较）
+	// 快速 title 比对
 	newTitle := strings.TrimSpace(newRequest.Title())
 	if len(newTitle) > 0 {
 		if baseRequest.Title() == newTitle || errorHostRequest.Title() == newTitle {
@@ -582,7 +707,7 @@ func (w *Worker) collision(
 		}
 	}
 
-	// 快速相似度检查（与基准请求和错误请求比较，使用带阈值的提前终止）
+	// 快速相似度检查
 	_, exceeded1 := diffpage.GetRatioWithThreshold(baseRequest.BodyFormat(), newRequest.BodyFormat(), w.cfg.SimilarityRatio)
 	if exceeded1 {
 		if w.outputErrorLog {
@@ -600,8 +725,6 @@ func (w *Worker) collision(
 	}
 
 	// ===== 通过初步检查，发送相对错误请求进行深度验证 =====
-	// 延迟发送：只有通过了上面所有轻量级检查才发送这个请求
-	// 这样可以大幅减少实际发出的HTTP请求数量
 
 	newRequest2, err := httpclient.SendHTTPGetRequest(protocol, ip, w.cfg.HTTP.RelativeHostName+host)
 	if err != nil {
@@ -614,12 +737,9 @@ func (w *Worker) collision(
 	// 相对错误请求也检测WAF
 	if w.isWAFBlocked(newRequest2) {
 		tracker.recordBlock()
-		// 相对错误请求被WAF拦截，但碰撞请求本身没有被拦截
-		// 这种情况下碰撞请求的结果仍然有参考价值，继续处理
 		if w.outputErrorLog {
 			fmt.Printf("info: 协议:%s, ip:%s, host:%s 相对错误请求被WAF拦截,跳过相对比对\n", protocol, ip, host)
 		}
-		// 跳过与相对错误请求的比对，直接进入数据样本和WAF特征检查
 	} else {
 		// 相对错误请求的长度检查
 		if newRequest2.Location == "" && newRequest2.ContentLen <= 0 {
@@ -659,35 +779,33 @@ func (w *Worker) collision(
 		}
 	}
 
-	// 数据样本生成（延迟生成，只在第一次需要时才创建）
-	if w.cfg.DataSample.Number > 0 && len(*dataSample) == 0 {
-		for i := 0; i < w.cfg.DataSample.Number; i++ {
-			sampleReq, err := httpclient.SendHTTPGetRequest(protocol, ip, w.cfg.HTTP.ErrorHost)
-			if err == nil {
-				*dataSample = append(*dataSample, sampleReq)
+	// 数据样本比对（使用共享缓存）
+	if w.cfg.DataSample.Number > 0 {
+		cache := getSampleCache()
+		samples := cache.getOrCreateSamples(sampleKey, protocol, ip, w.cfg.HTTP.ErrorHost, w.cfg.DataSample.Number)
+		if len(samples) > 0 {
+			if sampleSimilarityCheck(newRequest.BodyFormat(), samples, w.cfg.SimilarityRatio) {
+				if w.outputErrorLog {
+					fmt.Printf("协议:%s, ip:%s, host:%s, title:%s, 数据包大小:%d, 状态码:%d 数据样本匹配成功,可能为误报,忽略处理\n",
+						protocol, ip, host, newRequest.Title(), newRequest.ContentLen, newRequest.StatusCode)
+				}
+				return collisionResultFailed
 			}
-		}
-	}
-
-	// 数据样本比对
-	if len(*dataSample) > 0 {
-		if sampleSimilarityCheck(newRequest.BodyFormat(), *dataSample, w.cfg.SimilarityRatio) {
-			if w.outputErrorLog {
-				fmt.Printf("协议:%s, ip:%s, host:%s, title:%s, 数据包大小:%d, 状态码:%d 数据样本匹配成功,可能为误报,忽略处理\n",
-					protocol, ip, host, newRequest.Title(), newRequest.ContentLen, newRequest.StatusCode)
-			}
-			return collisionResultFailed
 		}
 	}
 
 	// WAF 检查（使用缓存的黑名单）
-	if w.cfg.DataSample.Number > 0 && len(*dataSample) > 0 {
-		if ok, wafReq := w.wafFeatureMatchingCached(baseRequest, newRequest); !ok {
-			if w.outputErrorLog {
-				fmt.Printf("协议:%s, ip:%s, host:%s, title:%s, 数据包大小:%d, 状态码:%d 匹配到waf特征,忽略处理\n",
-					protocol, ip, wafReq.Host, wafReq.Title(), wafReq.ContentLen, wafReq.StatusCode)
+	if w.cfg.DataSample.Number > 0 {
+		cache := getSampleCache()
+		samples := cache.getOrCreateSamples(sampleKey, protocol, ip, w.cfg.HTTP.ErrorHost, w.cfg.DataSample.Number)
+		if len(samples) > 0 {
+			if ok, wafReq := w.wafFeatureMatchingCached(baseRequest, newRequest); !ok {
+				if w.outputErrorLog {
+					fmt.Printf("协议:%s, ip:%s, host:%s, title:%s, 数据包大小:%d, 状态码:%d 匹配到waf特征,忽略处理\n",
+						protocol, ip, wafReq.Host, wafReq.Title(), wafReq.ContentLen, wafReq.StatusCode)
+				}
+				return collisionResultFailed
 			}
-			return collisionResultFailed
 		}
 	}
 

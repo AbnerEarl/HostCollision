@@ -157,7 +157,7 @@ func DefaultConfig() *Config {
 			RelativeHostName: "q1w2e3sr4.",
 		},
 		SimilarityRatio: 0.7,
-		ThreadTotal:     6,
+		ThreadTotal:     10,
 		DataSource: DataSourceConfig{
 			IPFilePath:   "./dataSource/ipList.txt",
 			HostFilePath: "./dataSource/hostList.txt",
@@ -186,7 +186,7 @@ func DefaultConfig() *Config {
 			HTTPXPoweredBy: []string{"waf"},
 		},
 		DataSample: DataSampleConfig{
-			Number: 10,
+			Number: 5,
 		},
 		AntiDetection: AntiDetectionConfig{
 			RandomUA: true,
@@ -200,11 +200,11 @@ func DefaultConfig() *Config {
 					"CF-Connecting-IP": "127.0.0.1",
 				},
 			},
-			RateLimit: 50,
+			RateLimit: 100,
 			Delay: DelayConfig{
 				IsStart: true,
-				MinMs:   1000,
-				MaxMs:   3000,
+				MinMs:   200,
+				MaxMs:   800,
 			},
 		},
 	}

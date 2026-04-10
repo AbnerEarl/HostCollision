@@ -167,17 +167,27 @@ func main() {
 	var results []*collision.CollisionResult
 	var resultsMu sync.Mutex
 
-	// 控制台进度条
+	// IP 预检测：快速过滤不可达的IP，避免后续大量无效请求
+	fmt.Println("=======================IP 预 检 测=======================")
+	fmt.Printf("开始检测 %d 个IP的可达性...\n", len(ipList))
+	ipList = collision.PreCheckIPs(ipList, scanProtocols, outputErrorLog)
+	if len(ipList) == 0 {
+		fmt.Println("\n所有IP均不可达, 退出程序 :(")
+		os.Exit(0)
+	}
+	fmt.Printf("预检测完成, %d 个IP可达\n", len(ipList))
+
+	// 控制台进度条（使用预检测后的IP数量计算）
 	requestTotal := int64(len(ipList) * len(scanProtocols) * len(hostList))
 	consoleProgressBar := progress.NewConsoleProgressBar(0, requestTotal)
 
-	// IP 数据分块
-	ipChunks := helpers.ListChunkSplit(ipList, threadTotal)
+	// 创建全局任务队列（替代IP分块，实现更均衡的负载分配）
+	taskQueue := collision.NewTaskQueue(ipList, scanProtocols)
 
-	// 建立 goroutine 池
+	// 建立 goroutine 池（所有Worker从同一个队列竞争消费任务）
 	fmt.Println("=======================建 立 线 程 池=======================")
 	var wg sync.WaitGroup
-	for i, chunk := range ipChunks {
+	for i := 0; i < threadTotal; i++ {
 		fmt.Printf("协程 %d 开始运行\n", i+1)
 		wg.Add(1)
 		worker := collision.NewWorker(
@@ -186,13 +196,13 @@ func main() {
 			&results,
 			&resultsMu,
 			scanProtocols,
-			chunk,
+			nil, // 不再分配IP列表，从队列消费
 			hostList,
 			outputErrorLog,
 		)
 		go func() {
 			defer wg.Done()
-			worker.Run()
+			worker.RunFromQueue(taskQueue)
 		}()
 	}
 

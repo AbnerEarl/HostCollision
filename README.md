@@ -438,14 +438,14 @@ results, err := hostcollision.RunHTTPSOnly(ipList, hostList)
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `Protocols` | `[]string` | `["http://","https://"]` | 扫描协议 |
-| `Threads` | `int` | `6` | 并发 goroutine 数 |
+| `Threads` | `int` | `10` | 并发 goroutine 数 |
 | `OutputErrorLog` | `bool` | `false` | 是否输出错误日志 |
 | `CollisionSuccessStatusCode` | `string` | `"200,301,302,404"` | 成功状态码白名单 |
-| `DataSampleNumber` | `int` | `10` | 数据样本次数（0=关闭） |
+| `DataSampleNumber` | `int` | `5` | 数据样本次数（0=关闭） |
 | `SimilarityRatio` | `float64` | `0.7` | 相似度阈值（0~1） |
-| `RateLimit` | `int` | `50` | 每秒最大请求数（0=不限） |
-| `DelayMin` | `int` | `1000` | 最小延迟（ms） |
-| `DelayMax` | `int` | `3000` | 最大延迟（ms） |
+| `RateLimit` | `int` | `100` | 每秒最大请求数（0=不限） |
+| `DelayMin` | `int` | `200` | 最小延迟（ms） |
+| `DelayMax` | `int` | `800` | 最大延迟（ms） |
 | `RandomUA` | `bool` | `true` | UA 随机化 |
 | `FakeHeaders` | `bool` | `true` | Header 伪造 |
 | `FakeHeadersMap` | `map[string]string` | X-Forwarded-For 等 | 自定义伪造 Header |
@@ -489,19 +489,19 @@ type Result struct {
 | `-sp` | 扫描协议（逗号分隔） | `http,https` | `-sp http` |
 | `-ifp` | IP 列表文件路径 | `./dataSource/ipList.txt` | `-ifp /tmp/ips.txt` |
 | `-hfp` | Host 列表文件路径 | `./dataSource/hostList.txt` | `-hfp /tmp/hosts.txt` |
-| `-t` | 最大并发线程数 | `6` | `-t 10` |
+| `-t` | 最大并发线程数 | `10` | `-t 16` |
 | `-o` | 输出格式（逗号分隔） | `csv,txt` | `-o csv` |
 | `-ioel` | 是否输出错误日志 | `true` | `-ioel false` |
 | `-cssc` | 碰撞成功状态码白名单 | `200,301,302,404` | `-cssc 200,301,302` |
-| `-dsn` | 数据样本请求次数（0=关闭） | `10` | `-dsn 0` |
+| `-dsn` | 数据样本请求次数（0=关闭） | `5` | `-dsn 0` |
 
 ### 防检测参数
 
 | 参数 | 说明 | 默认值 | 示例 |
 |------|------|--------|------|
-| `-rate` | 速率控制：每秒最大请求数（0=不限） | `50` | `-rate 30` |
-| `-dmin` | 延迟扫描：最小间隔（毫秒） | `1000` | `-dmin 500` |
-| `-dmax` | 延迟扫描：最大间隔（毫秒） | `3000` | `-dmax 5000` |
+| `-rate` | 速率控制：每秒最大请求数（0=不限） | `100` | `-rate 30` |
+| `-dmin` | 延迟扫描：最小间隔（毫秒） | `200` | `-dmin 500` |
+| `-dmax` | 延迟扫描：最大间隔（毫秒） | `800` | `-dmax 5000` |
 | `-ppf` | 代理池文件路径 | — | `-ppf ./proxyList.txt` |
 | `-rua` | UA 随机化开关 | `true` | `-rua false` |
 
@@ -607,14 +607,14 @@ http:
 similarityRatio: 0.7
 
 # 并发线程数
-threadTotal: 6
+threadTotal: 10
 
 # 碰撞成功的状态码白名单
 collisionSuccessStatusCode: "200,301,302,404"
 
-# 数据样本请求次数（0=关闭，建议 ≥10）
+# 数据样本请求次数（0=关闭，建议 3~5）
 dataSample:
-  number: 10
+  number: 5
 ```
 
 ### WAF 特征黑名单
@@ -652,12 +652,12 @@ antiDetection:
       X-Client-IP: "127.0.0.1"
       CF-Connecting-IP: "127.0.0.1"
 
-  rateLimit: 50           # 每秒最大请求数（0=不限）
+  rateLimit: 100          # 每秒最大请求数（0=不限）
 
   delay:                  # 延迟扫描
     isStart: true
-    minMs: 1000           # 最小间隔（毫秒）
-    maxMs: 3000           # 最大间隔（毫秒）
+    minMs: 200            # 最小间隔（毫秒）
+    maxMs: 800            # 最大间隔（毫秒）
 ```
 
 ---
@@ -824,7 +824,7 @@ cat fofa_results.txt | awk -F',' '{print $1}' | sort -u > ips.txt
 ### Q: 碰撞出来的结果都是误报怎么办？
 A: 尝试以下调整：
 1. 提高相似度阈值：`similarityRatio: 0.8`（更严格）
-2. 增加数据样本次数：`-dsn 20`
+2. 增加数据样本次数：`-dsn 10`
 3. 检查并补充 WAF 黑名单特征
 4. 调整状态码白名单：`-cssc 200`（只关注 200）
 

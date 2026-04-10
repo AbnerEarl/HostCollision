@@ -445,6 +445,90 @@ func (r *HttpCustomRequest) FilteredPageContent() string {
 
 // ========== 核心 HTTP 请求函数 ==========
 
+// SendHTTPGetRequestQuick 快速发送HTTP GET请求（用于IP预检测）
+// 不受速率限制和延迟扫描影响，使用较短的超时时间
+func SendHTTPGetRequestQuick(protocol, ip, host string) (*HttpCustomRequest, error) {
+	cfg := config.GetInstance()
+
+	targetURL := protocol + ip
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 5 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 5 * time.Second,
+		DisableKeepAlives:     true, // 预检测不需要连接复用
+	}
+
+	// 代理配置
+	if cfg.HTTP.ProxyPool.IsStart {
+		pm := GetProxyPoolManager()
+		if pm.Size() > 0 {
+			transport.Proxy = func(req *http.Request) (*url.URL, error) {
+				proxyAddr := pm.Next()
+				return url.Parse(proxyAddr)
+			}
+		}
+	} else if cfg.HTTP.Proxy.IsStart {
+		proxyStr := fmt.Sprintf("http://%s:%d", cfg.HTTP.Proxy.Host, cfg.HTTP.Proxy.Port)
+		proxyURL, err := url.Parse(proxyStr)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   8 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	req.Header.Set("User-Agent", defaultUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Connection", "close")
+
+	if host != "" {
+		req.Host = host
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 预检测只读取少量数据
+	limitedReader := io.LimitReader(resp.Body, 4096)
+	body, _ := io.ReadAll(limitedReader)
+	io.Copy(io.Discard, resp.Body)
+
+	requestHost := host
+	if requestHost == "" {
+		requestHost = ip
+	}
+
+	return &HttpCustomRequest{
+		Host:          requestHost,
+		Body:          string(body),
+		StatusCode:    resp.StatusCode,
+		ContentLen:    int(resp.ContentLength),
+		Location:      resp.Header.Get("Location"),
+		ServerHeader:  resp.Header.Get("Server"),
+		XPoweredByVal: resp.Header.Get("X-Powered-By"),
+	}, nil
+}
+
 // SendHTTPGetRequest 发送HTTP GET请求
 // 支持: UA 随机化、Header 伪造、代理池轮换、速率限制、延迟扫描、连接池复用
 func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {

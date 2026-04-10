@@ -58,7 +58,7 @@ similarityRatio: 0.7
 # 注意:
 #   会自动根据输入的ip总数,来动态启动goroutine执行任务
 #   设置6的话,意思是最多可以开几个goroutine来执行任务的意思
-threadTotal: 6
+threadTotal: 10
 
 # host碰撞的数据来源地址
 dataSource:
@@ -115,7 +115,7 @@ dataSample:
   # 最小值为0, 小于等于0, 表示关闭该功能
   # 程序将会拿该参数,请求n次作为数据的匹配样本
   # 建议: 建议设置为10次或是以上,因为如果样本少了,那么就没有任何的意义
-  number: 10
+  number: 5
 
 # 防检测/防封禁配置
 # 用于对抗 WAF 限流、IP 封禁、行为检测等安全策略
@@ -148,7 +148,7 @@ antiDetection:
   # 0 表示不限制
   # 建议: 设置为 30~50，避免触发 WAF 限流规则
   # 命令行参数 -rate 可覆盖此配置
-  rateLimit: 50
+  rateLimit: 100
 
   # 延迟扫描（请求间隔随机化）
   # 每次请求之间随机等待 minMs~maxMs 毫秒
@@ -157,6 +157,6 @@ antiDetection:
   delay:
     isStart: true
     # 最小间隔（毫秒）
-    minMs: 1000
+    minMs: 200
     # 最大间隔（毫秒）
-    maxMs: 3000
+    maxMs: 800

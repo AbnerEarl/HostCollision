@@ -182,8 +182,8 @@ func ResetInstance() {
 func DefaultConfig() *Config {
 	return &Config{
 		HTTP: HTTPConfig{
-			ReadTimeout:    10,
-			ConnectTimeout: 10,
+			ReadTimeout:    8,
+			ConnectTimeout: 5,
 			Proxy: ProxyConfig{
 				IsStart: false,
 				Host:    "127.0.0.1",
@@ -200,7 +200,7 @@ func DefaultConfig() *Config {
 			RelativeHostName: "q1w2e3sr4.",
 		},
 		SimilarityRatio: 0.7,
-		ThreadTotal:     10,
+		ThreadTotal:     30,
 		DataSource: DataSourceConfig{
 			IPFilePath:   "./dataSource/ipList.txt",
 			HostFilePath: "./dataSource/hostList.txt",
@@ -229,7 +229,7 @@ func DefaultConfig() *Config {
 			HTTPXPoweredBy: []string{"waf"},
 		},
 		DataSample: DataSampleConfig{
-			Number: 5,
+			Number: 3,
 		},
 		AntiDetection: AntiDetectionConfig{
 			RandomUA: true,
@@ -243,27 +243,27 @@ func DefaultConfig() *Config {
 					"CF-Connecting-IP": "127.0.0.1",
 				},
 			},
-			RateLimit: 100,
+			RateLimit: 200,
 			Delay: DelayConfig{
 				IsStart: true,
-				MinMs:   200,
-				MaxMs:   800,
+				MinMs:   50,
+				MaxMs:   200,
 			},
 		},
 		Optimization: OptimizationConfig{
 			EnableDNSFilter:           true,
 			DNSMatchMode:              "16",
-			DNSConcurrency:            50,
+			DNSConcurrency:            100,
 			EnableResponseElimination: true,
 			ResponseSampleSize:        500,
 			FullScan:                  false,
-			// 默认阈值: 按100QPS计算，1小时可完成 100*3600=360000 次请求
-			AutoFullScanThreshold: 360000,
+			// 默认阈值: 按200QPS计算，1小时可完成 200*3600=720000 次请求
+			AutoFullScanThreshold: 720000,
 			// 方案一: HEAD 预筛选（默认开启）
 			EnableHEADPreFilter: true,
 			// 方案二: TLS 证书 SAN 提取（默认开启）
 			EnableTLSScan:      true,
-			TLSScanConcurrency: 30,
+			TLSScanConcurrency: 50,
 			// 方案三: 基准指纹缓存（默认开启）
 			EnableFingerprintCache: true,
 			// 方案五: 自适应分阶段采样（默认开启）

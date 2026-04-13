@@ -119,7 +119,7 @@ type Options struct {
 	// 可选值: "16"(默认/16网段), "24"(/24网段), "exact"(精确匹配)
 	DNSMatchMode string
 
-	// DNSConcurrency DNS 解析并发数（默认50）
+	// DNSConcurrency DNS 解析并发数（默认100）
 	DNSConcurrency int
 
 	// EnableResponseElimination 是否启用响应快速排除（默认开启）
@@ -134,7 +134,7 @@ type Options struct {
 	FullScan bool
 
 	// AutoFullScanThreshold 自动全量扫描阈值
-	// 当预估碰撞组合数低于此值时自动切换为全量扫描（默认360000，约1小时可完成）
+	// 当预估碰撞组合数低于此值时自动切换为全量扫描（默认720000，约200QPS下1小时可完成）
 	// 设为 0 表示禁用自动全量扫描
 	AutoFullScanThreshold int64
 
@@ -147,7 +147,7 @@ type Options struct {
 	// 对 HTTPS 端口做 TLS 握手，提取证书中的域名列表，标记为最高优先级
 	EnableTLSScan *bool
 
-	// TLSScanConcurrency TLS 扫描并发数（默认30）
+	// TLSScanConcurrency TLS 扫描并发数（默认50）
 	TLSScanConcurrency int
 
 	// EnableFingerprintCache 是否启用基准指纹缓存快速比对（默认开启）
@@ -245,14 +245,14 @@ func boolPtr(b bool) *bool {
 func DefaultOptions() *Options {
 	return &Options{
 		Protocols:                  []string{"http://", "https://"},
-		Threads:                    10,
+		Threads:                    30,
 		OutputErrorLog:             false,
 		CollisionSuccessStatusCode: "200,301,302,404",
-		DataSampleNumber:           5,
+		DataSampleNumber:           3,
 		SimilarityRatio:            0.7,
-		RateLimit:                  100,
-		DelayMin:                   200,
-		DelayMax:                   800,
+		RateLimit:                  200,
+		DelayMin:                   50,
+		DelayMax:                   200,
 		RandomUA:                   true,
 		FakeHeaders:                true,
 		FakeHeadersMap: map[string]string{
@@ -262,8 +262,8 @@ func DefaultOptions() *Options {
 			"X-Client-IP":      "127.0.0.1",
 			"CF-Connecting-IP": "127.0.0.1",
 		},
-		ReadTimeout:      10,
-		ConnectTimeout:   10,
+		ReadTimeout:      8,
+		ConnectTimeout:   5,
 		ErrorHost:        "error.hchostjwdlh666666.com",
 		RelativeHostName: "q1w2e3sr4.",
 		Blacklists: &BlacklistsOption{
@@ -281,17 +281,17 @@ func DefaultOptions() *Options {
 		},
 		// 优化策略默认值
 		EnableDNSFilter:           boolPtr(true),
-		DNSMatchMode:              "16",
-		DNSConcurrency:            50,
+		DNSMatchMode:              "24",
+		DNSConcurrency:            100,
 		EnableResponseElimination: boolPtr(true),
 		ResponseSampleSize:        500,
 		FullScan:                  false,
-		AutoFullScanThreshold:     360000,
+		AutoFullScanThreshold:     720000,
 		// 方案一: HEAD 预筛选（默认开启）
 		EnableHEADPreFilter: boolPtr(true),
 		// 方案二: TLS 证书 SAN 提取（默认开启）
 		EnableTLSScan:      boolPtr(true),
-		TLSScanConcurrency: 30,
+		TLSScanConcurrency: 50,
 		// 方案三: 基准指纹缓存（默认开启）
 		EnableFingerprintCache: boolPtr(true),
 		// 方案五: 自适应分阶段采样（默认开启）
@@ -324,7 +324,7 @@ func applyOptimizations(ipList, hostList []string, opts *Options) []string {
 	// 自动全量扫描: 数据量较小时（预估1小时内可完成），自动使用全量扫描
 	threshold := opts.AutoFullScanThreshold
 	if threshold <= 0 {
-		threshold = 360000 // 默认阈值
+		threshold = 720000 // 默认阈值
 	}
 	if totalCombinations <= threshold {
 		fmt.Printf("[优化策略] 碰撞组合数 %d ≤ 阈值 %d, 自动使用全量扫描\n",

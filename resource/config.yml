@@ -1,9 +1,11 @@
 # 请求相关配置
 http:
   # 从主机读取数据的超时时间(单位: 秒)
-  readTimeout: 10
+  # 正常Web服务响应通常<3秒，8秒足够覆盖慢速服务
+  readTimeout: 8
   # 连接主机的超时时间(单位: 秒)
-  connectTimeout: 10
+  # TCP连接建立通常<1秒，5秒足够覆盖高延迟网络，减少对不可达IP的等待
+  connectTimeout: 5
 
   # 单一代理设置（与代理池互斥，代理池优先级更高）
   proxy:
@@ -57,8 +59,9 @@ similarityRatio: 0.7
 # 最小值为1, 小于等于0, 会重置为1
 # 注意:
 #   会自动根据输入的ip总数,来动态启动goroutine执行任务
-#   设置6的话,意思是最多可以开几个goroutine来执行任务的意思
-threadTotal: 10
+#   Host碰撞主要是I/O等待(网络请求)，CPU占用极低
+#   30个线程可以充分利用I/O等待时间，全局速率限制器控制总QPS
+threadTotal: 30
 
 # host碰撞的数据来源地址
 dataSource:
@@ -114,8 +117,8 @@ dataSample:
   # 样本请求次数
   # 最小值为0, 小于等于0, 表示关闭该功能
   # 程序将会拿该参数,请求n次作为数据的匹配样本
-  # 建议: 建议设置为10次或是以上,因为如果样本少了,那么就没有任何的意义
-  number: 5
+  # 3次样本已足够建立可靠的基准比对，减少大数据量下的额外请求开销
+  number: 3
 
 # 防检测/防封禁配置
 # 用于对抗 WAF 限流、IP 封禁、行为检测等安全策略
@@ -146,20 +149,21 @@ antiDetection:
 
   # 速率控制（每秒最大请求数）
   # 0 表示不限制
-  # 建议: 设置为 30~50，避免触发 WAF 限流规则
+  # 200 QPS 分散到 1000+ 个不同IP上，每个IP实际约 0.2 QPS，远低于WAF阈值
   # 命令行参数 -rate 可覆盖此配置
-  rateLimit: 100
+  rateLimit: 200
 
   # 延迟扫描（请求间隔随机化）
   # 每次请求之间随机等待 minMs~maxMs 毫秒
   # 用于避免请求频率固定而被行为检测识别
   # 注意: 延迟扫描与速率控制同时生效，取两者中更慢的速度
+  # 配合速率限制器已有全局QPS控制，延迟主要用于随机化请求间隔
   delay:
     isStart: true
-    # 最小间隔（毫秒）
-    minMs: 200
-    # 最大间隔（毫秒）
-    maxMs: 800
+    # 最小间隔（毫秒）- 50ms已足够产生随机性
+    minMs: 50
+    # 最大间隔（毫秒）- 配合50ms最小值，平均延迟125ms
+    maxMs: 200
 
 # 优化策略配置
 # 用于大数据量场景下减少无效碰撞请求，提升碰撞效率
@@ -178,7 +182,8 @@ optimization:
   dnsMatchMode: "16"
 
   # DNS 解析并发数
-  dnsConcurrency: 50
+  # DNS解析是纯I/O操作，不涉及目标服务器，100并发可加速DNS筛选阶段
+  dnsConcurrency: 100
 
   # 响应快速排除
   # 对每个 IP 碰撞前 N 个随机 Host，如果所有响应指纹都相同，
@@ -194,9 +199,9 @@ optimization:
 
   # 自动全量扫描阈值
   # 当预估碰撞组合数（IP数 × 协议数 × Host数）低于此值时，自动使用全量扫描
-  # 默认值 360000 约为 100QPS 下 1 小时可完成的碰撞量
+  # 默认值 720000 约为 200QPS 下 1 小时可完成的碰撞量
   # 设为 0 表示禁用自动全量扫描
-  autoFullScanThreshold: 360000
+  autoFullScanThreshold: 720000
 
   # HEAD 预筛选（方案一）
   # 对每个 IP 先发送 HEAD 请求获取响应头指纹，只有指纹与基准不同的 Host 才进入 GET 碰撞
@@ -210,7 +215,8 @@ optimization:
   # 支持各种 IP 格式：纯IP默认扫描443端口，带端口的IP扫描指定端口
   enableTLSScan: true
   # TLS 扫描并发数
-  tlsScanConcurrency: 30
+  # TLS握手是一次性操作，每个IP只做一次，不携带Host头，不触发WAF
+  tlsScanConcurrency: 50
 
   # 基准指纹缓存 + 快速比对（方案三）
   # 使用 FNV-1a hash 算法预计算基准响应的指纹

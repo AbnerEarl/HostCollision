@@ -2,6 +2,7 @@ package collision
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand"
 	"strings"
@@ -507,12 +508,96 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 	_ = baseRequest.BodyFormat()
 	_ = errorHostRequest.BodyFormat()
 
+	// ===== 方案三: 基准指纹缓存 =====
+	// 预计算基准响应和错误响应的 FNV hash 指纹，用于快速比对
+	var baseBodyHash, errorBodyHash uint64
+	if w.cfg.Optimization.EnableFingerprintCache {
+		baseBodyHash = fnvHash(baseRequest.BodyFormat())
+		errorBodyHash = fnvHash(errorHostRequest.BodyFormat())
+	}
+
 	// 打散 Host 列表顺序
 	shuffledHosts := make([]string, len(w.hostList))
 	copy(shuffledHosts, w.hostList)
 	rand.Shuffle(len(shuffledHosts), func(i, j int) {
 		shuffledHosts[i], shuffledHosts[j] = shuffledHosts[j], shuffledHosts[i]
 	})
+
+	// ===== 方案一: HEAD 预筛选 =====
+	// 对每个 IP 先发送 HEAD 请求获取基准响应头指纹，
+	// 然后对每个 Host 发送 HEAD 请求，只有指纹与基准不同的 Host 才进入 GET 碰撞
+	// 安全保障:
+	//   1. 如果服务不支持 HEAD（返回 405/501），自动回退到全量 GET 碰撞
+	//   2. 如果 HEAD 基准请求被 WAF 拦截，自动回退到全量 GET 碰撞
+	//   3. HEAD 筛选后候选数量过少（<5%）时，自动回退到全量 GET 碰撞（防止漏报）
+	var headFilteredHosts []string
+	headFilterEnabled := false
+
+	if w.cfg.Optimization.EnableHEADPreFilter && len(shuffledHosts) > 10 {
+		headFilteredHosts, headFilterEnabled = w.headPreFilter(protocol, ip, shuffledHosts, tracker)
+		if headFilterEnabled && len(headFilteredHosts) > 0 {
+			if w.outputErrorLog {
+				fmt.Printf("info: 站点 %s HEAD预筛选: %d → %d 个候选Host\n",
+					protocol+ip, len(shuffledHosts), len(headFilteredHosts))
+			}
+			// HEAD 筛选后的 Host 数量过少（<5%），可能是 HEAD/GET 行为不一致，回退到全量
+			minCandidates := len(shuffledHosts) / 20 // 5%
+			if minCandidates < 3 {
+				minCandidates = 3
+			}
+			if len(headFilteredHosts) < minCandidates {
+				if w.outputErrorLog {
+					fmt.Printf("info: 站点 %s HEAD预筛选候选数过少(%d < %d), 回退到全量GET碰撞\n",
+						protocol+ip, len(headFilteredHosts), minCandidates)
+				}
+				headFilterEnabled = false
+			} else {
+				// 使用 HEAD 筛选后的候选列表
+				// 跳过的 Host 计入已处理数量
+				skippedCount := len(shuffledHosts) - len(headFilteredHosts)
+				if skippedCount > 0 {
+					atomic.AddInt64(w.numOfRequest, int64(skippedCount))
+				}
+				shuffledHosts = headFilteredHosts
+			}
+		} else if headFilterEnabled && len(headFilteredHosts) == 0 {
+			// HEAD 筛选后无候选，所有 Host 指纹都相同，跳过该 IP
+			atomic.AddInt64(w.numOfRequest, int64(len(shuffledHosts)))
+			if w.outputErrorLog {
+				fmt.Printf("info: 站点 %s HEAD预筛选: 所有Host指纹与基准相同, 跳过\n", protocol+ip)
+			}
+			return
+		}
+		// headFilterEnabled == false 表示 HEAD 不可用，回退到全量 GET
+	}
+
+	// ===== 方案五: 自适应分阶段采样排除 =====
+	// 替代原有的固定采样排除，分阶段逐步增加采样数量
+	// 阶段1: 采样 50 个 Host，如果全部相同 → 阶段2
+	// 阶段2: 采样 200 个 Host，如果全部相同 → 阶段3
+	// 阶段3: 采样 500 个 Host，如果全部相同 → 跳过该 IP
+	// 任何阶段发现不同响应 → 立即进入完整碰撞
+	// 注意: WAF 拦截的响应不计入指纹比对（避免 WAF 干扰判断）
+	sampleSize := w.cfg.Optimization.ResponseSampleSize
+	enableElimination := w.cfg.Optimization.EnableResponseElimination && sampleSize > 0 && len(shuffledHosts) > sampleSize
+
+	if enableElimination {
+		var skipIP bool
+		if w.cfg.Optimization.EnableAdaptiveSampling {
+			skipIP = w.adaptiveSamplingElimination(protocol, ip, shuffledHosts, sampleSize, tracker)
+		} else {
+			skipIP = w.fixedSamplingElimination(protocol, ip, shuffledHosts, sampleSize, tracker)
+		}
+		if skipIP {
+			return
+		}
+
+		// 采样中发现了不同响应，需要对所有 Host（包括已采样的）做完整碰撞
+		// 重新打散列表，从头开始碰撞
+		rand.Shuffle(len(shuffledHosts), func(i, j int) {
+			shuffledHosts[i], shuffledHosts[j] = shuffledHosts[j], shuffledHosts[i]
+		})
+	}
 
 	// 重试队列
 	var retryQueue []string
@@ -525,7 +610,7 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 			time.Sleep(waitDur)
 		}
 
-		result := w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker)
+		result := w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker, baseBodyHash, errorBodyHash)
 		if result == collisionResultWAFBlocked {
 			retryQueue = append(retryQueue, host)
 		}
@@ -559,9 +644,240 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 			extraDelay := 2000 + rand.Intn(3000)
 			time.Sleep(time.Duration(extraDelay) * time.Millisecond)
 
-			w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker)
+			w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker, baseBodyHash, errorBodyHash)
 		}
 	}
+}
+
+// ========== 方案一: HEAD 预筛选 ==========
+
+// headPreFilter 使用 HEAD 请求对 Host 列表进行预筛选
+// 返回: (候选Host列表, 是否成功启用HEAD筛选)
+// 安全保障:
+//   - 服务不支持 HEAD（405/501）→ 返回 (nil, false)，回退到全量 GET
+//   - HEAD 基准请求被 WAF 拦截 → 返回 (nil, false)，回退到全量 GET
+//   - HEAD 响应与 GET 行为不一致的风险通过候选数量阈值兜底
+func (w *Worker) headPreFilter(protocol, ip string, hosts []string, tracker *wafTracker) ([]string, bool) {
+	// 1. 发送基准 HEAD 请求（无 Host 头）
+	baseHead, err := httpclient.SendHTTPHeadRequest(protocol, ip, "")
+	if err != nil {
+		if w.outputErrorLog {
+			fmt.Printf("info: 站点 %s HEAD基准请求失败, 回退到GET碰撞\n", protocol+ip)
+		}
+		return nil, false
+	}
+
+	// 检查服务是否支持 HEAD 方法
+	// 405 Method Not Allowed / 501 Not Implemented 表示不支持 HEAD
+	if baseHead.StatusCode == 405 || baseHead.StatusCode == 501 {
+		if w.outputErrorLog {
+			fmt.Printf("info: 站点 %s 不支持HEAD方法(状态码%d), 回退到GET碰撞\n",
+				protocol+ip, baseHead.StatusCode)
+		}
+		return nil, false
+	}
+
+	// 检查 HEAD 基准是否被 WAF 拦截（通过 Server/X-Powered-By 头判断）
+	if baseHead.XPoweredBy != "" {
+		xpLower := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(baseHead.XPoweredBy, " ", "")))
+		for _, bl := range w.xPoweredByBlacklists {
+			if strings.Contains(xpLower, bl) {
+				if w.outputErrorLog {
+					fmt.Printf("info: 站点 %s HEAD基准请求命中WAF特征, 回退到GET碰撞\n", protocol+ip)
+				}
+				return nil, false
+			}
+		}
+	}
+
+	// 2. 发送绝对错误 Host 的 HEAD 请求
+	errorHead, err := httpclient.SendHTTPHeadRequest(protocol, ip, w.cfg.HTTP.ErrorHost)
+	if err != nil {
+		if w.outputErrorLog {
+			fmt.Printf("info: 站点 %s HEAD错误请求失败, 回退到GET碰撞\n", protocol+ip)
+		}
+		return nil, false
+	}
+
+	// 基准指纹
+	baseFingerprint := baseHead.String()
+	errorFingerprint := errorHead.String()
+
+	// 3. 对每个 Host 发送 HEAD 请求，筛选出指纹不同的候选
+	var candidates []string
+	for _, host := range hosts {
+		if waitDur := tracker.shouldWait(); waitDur > 0 {
+			time.Sleep(waitDur)
+		}
+
+		hostHead, err := httpclient.SendHTTPHeadRequest(protocol, ip, host)
+		if err != nil {
+			// HEAD 请求失败的 Host 保留为候选（安全起见）
+			candidates = append(candidates, host)
+			continue
+		}
+
+		// 如果服务对某个 Host 返回 405/501，说明该 Host 可能有特殊路由
+		// 保留为候选
+		if hostHead.StatusCode == 405 || hostHead.StatusCode == 501 {
+			candidates = append(candidates, host)
+			continue
+		}
+
+		// 检查是否被 WAF 拦截（429 状态码）
+		if hostHead.StatusCode == 429 {
+			tracker.recordBlock()
+			// WAF 拦截的 Host 保留为候选
+			candidates = append(candidates, host)
+			continue
+		}
+
+		hostFingerprint := hostHead.String()
+
+		// 指纹与基准和错误请求都不同 → 候选
+		if hostFingerprint != baseFingerprint && hostFingerprint != errorFingerprint {
+			candidates = append(candidates, host)
+		}
+		// 指纹与基准或错误请求相同 → 过滤掉（大概率无效）
+	}
+
+	return candidates, true
+}
+
+// ========== 方案五: 自适应分阶段采样排除 ==========
+
+// adaptiveSamplingElimination 自适应分阶段采样排除
+// 分三个阶段逐步增加采样数量，对明显无效的 IP 更快跳过
+// 返回 true 表示应跳过该 IP
+func (w *Worker) adaptiveSamplingElimination(
+	protocol, ip string, hosts []string, maxSampleSize int, tracker *wafTracker,
+) bool {
+	// 分阶段采样数量
+	stages := []int{50, 200, maxSampleSize}
+
+	var firstFingerprint string
+	var totalSampled int
+
+	for stageIdx, stageSize := range stages {
+		if stageSize > len(hosts) {
+			stageSize = len(hosts)
+		}
+
+		// 从上次采样的位置继续
+		for i := totalSampled; i < stageSize; i++ {
+			host := hosts[i]
+			atomic.AddInt64(w.numOfRequest, 1)
+
+			if waitDur := tracker.shouldWait(); waitDur > 0 {
+				time.Sleep(waitDur)
+			}
+
+			sampleReq, err := httpclient.SendHTTPGetRequest(protocol, ip, host)
+			if err != nil {
+				continue
+			}
+
+			// WAF 拦截的响应不计入指纹比对（避免 WAF 干扰判断）
+			if w.isWAFBlocked(sampleReq) {
+				tracker.recordBlock()
+				continue
+			}
+			tracker.recordSuccess()
+
+			// 计算响应指纹: 状态码 + 内容长度 + Server头 + Title
+			fingerprint := fmt.Sprintf("%d|%d|%s|%s",
+				sampleReq.StatusCode, sampleReq.ContentLen,
+				sampleReq.ServerHeader, sampleReq.Title())
+
+			if firstFingerprint == "" {
+				firstFingerprint = fingerprint
+			} else if fingerprint != firstFingerprint {
+				// 发现不同响应，说明该 IP 有 Host 路由，需要完整碰撞
+				if w.outputErrorLog {
+					fmt.Printf("info: 站点 %s 自适应采样阶段%d: 第%d个Host发现不同响应, 进入完整碰撞\n",
+						protocol+ip, stageIdx+1, i+1)
+				}
+				return false
+			}
+		}
+
+		totalSampled = stageSize
+
+		// 如果当前阶段已经采样完所有 Host，直接判定
+		if stageSize >= len(hosts) {
+			break
+		}
+	}
+
+	// 所有阶段采样的 Host 响应指纹都相同
+	if firstFingerprint != "" {
+		remainingCount := len(hosts) - totalSampled
+		if remainingCount > 0 {
+			atomic.AddInt64(w.numOfRequest, int64(remainingCount))
+		}
+		if w.outputErrorLog {
+			fmt.Printf("info: 站点 %s 自适应采样 %d 个Host响应指纹全部相同, 跳过剩余 %d 个Host\n",
+				protocol+ip, totalSampled, remainingCount)
+		}
+		return true
+	}
+
+	return false
+}
+
+// fixedSamplingElimination 固定采样排除（原有逻辑，作为回退方案）
+// 返回 true 表示应跳过该 IP
+func (w *Worker) fixedSamplingElimination(
+	protocol, ip string, hosts []string, sampleSize int, tracker *wafTracker,
+) bool {
+	allSame := true
+	var firstFingerprint string
+
+	for i := 0; i < sampleSize && i < len(hosts); i++ {
+		host := hosts[i]
+		atomic.AddInt64(w.numOfRequest, 1)
+
+		if waitDur := tracker.shouldWait(); waitDur > 0 {
+			time.Sleep(waitDur)
+		}
+
+		sampleReq, err := httpclient.SendHTTPGetRequest(protocol, ip, host)
+		if err != nil {
+			continue
+		}
+
+		// WAF 拦截的响应不计入指纹比对
+		if w.isWAFBlocked(sampleReq) {
+			tracker.recordBlock()
+			continue
+		}
+		tracker.recordSuccess()
+
+		fingerprint := fmt.Sprintf("%d|%d|%s|%s",
+			sampleReq.StatusCode, sampleReq.ContentLen,
+			sampleReq.ServerHeader, sampleReq.Title())
+
+		if firstFingerprint == "" {
+			firstFingerprint = fingerprint
+		} else if fingerprint != firstFingerprint {
+			allSame = false
+			break
+		}
+	}
+
+	if allSame && firstFingerprint != "" {
+		remainingCount := len(hosts) - sampleSize
+		if remainingCount > 0 {
+			atomic.AddInt64(w.numOfRequest, int64(remainingCount))
+		}
+		if w.outputErrorLog {
+			fmt.Printf("info: 站点 %s 采样 %d 个Host响应指纹全部相同, 跳过剩余 %d 个Host\n",
+				protocol+ip, sampleSize, remainingCount)
+		}
+		return true
+	}
+
+	return false
 }
 
 // collisionOutcome 碰撞结果类型
@@ -617,11 +933,13 @@ func (w *Worker) isWAFBlocked(req *httpclient.HttpCustomRequest) bool {
 // 3. 使用带阈值的相似度计算，提前终止不可能达标的计算
 // 4. WAF自适应退避：检测到WAF不放弃，而是退避后重试
 // 5. 使用共享数据样本缓存，避免重复生成
+// 6. 方案三: 基准指纹缓存 + FNV hash 快速比对，跳过编辑距离计算
 func (w *Worker) collision(
 	sampleKey string,
 	baseRequest, errorHostRequest *httpclient.HttpCustomRequest,
 	protocol, ip, host string,
 	tracker *wafTracker,
+	baseBodyHash, errorBodyHash uint64,
 ) collisionOutcome {
 	// 碰撞请求
 	newRequest, err := httpclient.SendHTTPGetRequest(protocol, ip, host)
@@ -707,8 +1025,29 @@ func (w *Worker) collision(
 		}
 	}
 
-	// 快速相似度检查
-	_, exceeded1 := diffpage.GetRatioWithThreshold(baseRequest.BodyFormat(), newRequest.BodyFormat(), w.cfg.SimilarityRatio)
+	// ===== 方案三: 基准指纹缓存 + 快速比对 =====
+	// 先用 FNV hash 做快速比对（O(n)），hash 相同则直接判定为相似
+	// 只有 hash 不同时才做编辑距离计算（O(n*m)），大幅减少重量级计算
+	newBodyFormat := newRequest.BodyFormat()
+	if w.cfg.Optimization.EnableFingerprintCache && baseBodyHash > 0 {
+		newBodyHash := fnvHash(newBodyFormat)
+		// hash 完全相同 → 内容完全相同 → 直接判定为失败
+		if newBodyHash == baseBodyHash {
+			if w.outputErrorLog {
+				fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-4(指纹与基准完全相同)\n", protocol, ip, host)
+			}
+			return collisionResultFailed
+		}
+		if newBodyHash == errorBodyHash {
+			if w.outputErrorLog {
+				fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-4(指纹与错误请求完全相同)\n", protocol, ip, host)
+			}
+			return collisionResultFailed
+		}
+	}
+
+	// hash 不同，需要做编辑距离相似度检查
+	_, exceeded1 := diffpage.GetRatioWithThreshold(baseRequest.BodyFormat(), newBodyFormat, w.cfg.SimilarityRatio)
 	if exceeded1 {
 		if w.outputErrorLog {
 			fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-4(与基准相似度过高)\n", protocol, ip, host)
@@ -716,7 +1055,7 @@ func (w *Worker) collision(
 		return collisionResultFailed
 	}
 
-	_, exceeded2 := diffpage.GetRatioWithThreshold(errorHostRequest.BodyFormat(), newRequest.BodyFormat(), w.cfg.SimilarityRatio)
+	_, exceeded2 := diffpage.GetRatioWithThreshold(errorHostRequest.BodyFormat(), newBodyFormat, w.cfg.SimilarityRatio)
 	if exceeded2 {
 		if w.outputErrorLog {
 			fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-4(与错误请求相似度过高)\n", protocol, ip, host)
@@ -973,4 +1312,21 @@ func (w *Worker) httpHeaderXPoweredByWafMatchingCached(baseReq, newReq *httpclie
 		}
 	}
 	return false
+}
+
+// ========== 方案三: FNV hash 指纹计算 ==========
+
+// fnvHash 使用 FNV-1a 算法计算字符串的 64 位 hash 指纹
+// FNV-1a 是一种非加密 hash 算法，速度极快（比 MD5/SHA 快 10 倍以上）
+// 用于快速判断两个字符串是否相同，避免昂贵的编辑距离计算
+// 注意: hash 相同 → 内容极大概率相同（FNV-1a 碰撞率极低）
+//
+//	hash 不同 → 内容一定不同
+func fnvHash(s string) uint64 {
+	if s == "" {
+		return 0
+	}
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
 }

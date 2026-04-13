@@ -192,10 +192,11 @@ func (tp *TransportPool) GetTransport(key string, cfg *config.Config) *http.Tran
 		}).DialContext,
 		ResponseHeaderTimeout: time.Duration(cfg.HTTP.ReadTimeout) * time.Second,
 		// 启用连接复用：同一个IP的不同Host请求可以复用TCP连接
+		// 增大 MaxIdleConnsPerHost 以提升同一 IP 的连接复用率
 		DisableKeepAlives:   false,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     60 * time.Second,
 	}
 
 	// 代理配置（代理池优先 > 单一代理）
@@ -650,5 +651,121 @@ func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 		Location:      resp.Header.Get("Location"),
 		ServerHeader:  resp.Header.Get("Server"),
 		XPoweredByVal: resp.Header.Get("X-Powered-By"),
+	}, nil
+}
+
+// HeadFingerprint HEAD 请求的轻量级响应指纹
+// 仅包含响应头信息，不包含 Body，用于快速预筛选
+type HeadFingerprint struct {
+	StatusCode    int    // HTTP 状态码
+	ContentLength int64  // Content-Length 头（-1 表示未设置）
+	ServerHeader  string // Server 头
+	Location      string // Location 头
+	ContentType   string // Content-Type 头
+	XPoweredBy    string // X-Powered-By 头
+}
+
+// String 返回指纹的字符串表示（用于比对）
+func (f *HeadFingerprint) String() string {
+	return fmt.Sprintf("%d|%d|%s|%s|%s",
+		f.StatusCode, f.ContentLength, f.ServerHeader, f.Location, f.ContentType)
+}
+
+// SendHTTPHeadRequest 发送 HTTP HEAD 请求（轻量级，仅获取响应头）
+// HEAD 请求不返回 Body，速度比 GET 快 5-10 倍，用于快速预筛选
+// 支持: UA 随机化、Header 伪造、代理池轮换、速率限制、延迟扫描、连接池复用
+//
+// 注意: 并非所有服务都支持 HEAD 方法，调用方需要处理 405 Method Not Allowed 等情况
+func SendHTTPHeadRequest(protocol, ip, host string) (*HeadFingerprint, error) {
+	cfg := config.GetInstance()
+
+	// ===== 速率限制：等待令牌 =====
+	if globalRateLimiter != nil {
+		ctx, cancel := context.WithTimeout(context.Background(),
+			time.Duration(cfg.HTTP.ReadTimeout+cfg.HTTP.ConnectTimeout+10)*time.Second)
+		defer cancel()
+		if err := globalRateLimiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("速率限制等待超时: %w", err)
+		}
+	}
+
+	// ===== 延迟扫描：随机等待 =====
+	ApplyDelay(cfg)
+
+	// ===== 选择 User-Agent =====
+	userAgent := defaultUA
+	if cfg.AntiDetection.RandomUA {
+		userAgent = GetRandomUA()
+	}
+
+	targetURL := protocol + ip
+
+	// ===== 获取连接池中的 Transport（按 IP+协议 复用）=====
+	transportKey := protocol + ip
+	tp := GetTransportPool()
+	transport := tp.GetTransport(transportKey, cfg)
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(cfg.HTTP.ReadTimeout+cfg.HTTP.ConnectTimeout) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, err := http.NewRequest("HEAD", targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建HEAD请求失败: %w", err)
+	}
+
+	// ===== 设置请求头（与 GET 请求保持一致的指纹）=====
+	req.Header.Set("User-Agent", userAgent)
+	if cfg.AntiDetection.RandomUA {
+		req.Header.Set("Accept", getRandomAccept())
+		req.Header.Set("Accept-Language", getRandomAcceptLanguage())
+	} else {
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7")
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Connection", "keep-alive")
+
+	// ===== Header 伪造（Bypass WAF）=====
+	if cfg.AntiDetection.FakeHeaders.IsStart {
+		randomIP := getRandomFakeIP()
+		for key, value := range cfg.AntiDetection.FakeHeaders.Headers {
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if key != "" && value != "" {
+				keyLower := strings.ToLower(key)
+				if strings.Contains(keyLower, "ip") || strings.Contains(keyLower, "forwarded") {
+					req.Header.Set(key, randomIP)
+				} else {
+					req.Header.Set(key, value)
+				}
+			}
+		}
+	}
+
+	// ===== 设置 Host =====
+	if host != "" {
+		req.Host = host
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HEAD请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	// HEAD 请求不应有 Body，但仍需丢弃以便连接复用
+	io.Copy(io.Discard, resp.Body)
+
+	return &HeadFingerprint{
+		StatusCode:    resp.StatusCode,
+		ContentLength: resp.ContentLength,
+		ServerHeader:  resp.Header.Get("Server"),
+		Location:      resp.Header.Get("Location"),
+		ContentType:   resp.Header.Get("Content-Type"),
+		XPoweredBy:    resp.Header.Get("X-Powered-By"),
 	}, nil
 }

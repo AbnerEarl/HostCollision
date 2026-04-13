@@ -160,3 +160,69 @@ antiDetection:
     minMs: 200
     # 最大间隔（毫秒）
     maxMs: 800
+
+# 优化策略配置
+# 用于大数据量场景下减少无效碰撞请求，提升碰撞效率
+# 当数据量较小（预估1小时内可完成）时，会自动使用全量扫描，忽略优化策略
+optimization:
+  # DNS 反向筛选
+  # 对 Host 列表进行 DNS 解析，过滤与目标 IP 无关的 Host
+  # 保留: DNS 解析到目标 IP 段的 Host + DNS 解析失败的 Host（可能是已下线域名）
+  # 过滤: DNS 解析到完全无关 IP 的 Host
+  enableDNSFilter: true
+
+  # DNS 匹配模式
+  # "16": /16 网段匹配（宽松，默认）- 前两段IP相同即匹配
+  # "24": /24 网段匹配（严格）- 前三段IP相同即匹配
+  # "exact": 精确 IP 匹配（最严格）- IP完全相同才匹配
+  dnsMatchMode: "16"
+
+  # DNS 解析并发数
+  dnsConcurrency: 50
+
+  # 响应快速排除
+  # 对每个 IP 碰撞前 N 个随机 Host，如果所有响应指纹都相同，
+  # 说明该 IP 不做基于 Host 的路由，跳过剩余 Host
+  enableResponseElimination: true
+
+  # 响应快速排除的采样 Host 数量
+  # 仅当 Host 总量大于此值时才启用采样排除
+  responseSampleSize: 500
+
+  # 是否强制全量扫描（忽略所有优化策略）
+  fullScan: false
+
+  # 自动全量扫描阈值
+  # 当预估碰撞组合数（IP数 × 协议数 × Host数）低于此值时，自动使用全量扫描
+  # 默认值 360000 约为 100QPS 下 1 小时可完成的碰撞量
+  # 设为 0 表示禁用自动全量扫描
+  autoFullScanThreshold: 360000
+
+  # HEAD 预筛选（方案一）
+  # 对每个 IP 先发送 HEAD 请求获取响应头指纹，只有指纹与基准不同的 Host 才进入 GET 碰撞
+  # 安全保障：如果服务不支持 HEAD 方法（返回 405/501），会自动回退到 GET 碰撞
+  # 如果 HEAD 筛选后候选数量过少（<5%），也会自动回退到全量 GET 碰撞
+  enableHEADPreFilter: true
+
+  # TLS 证书 SAN 提取（方案二）
+  # 对 HTTPS 端口做 TLS 握手，提取证书中的域名列表（Subject Alternative Name）
+  # 匹配的域名标记为最高优先级（P0），排在碰撞列表最前面
+  # 支持各种 IP 格式：纯IP默认扫描443端口，带端口的IP扫描指定端口
+  enableTLSScan: true
+  # TLS 扫描并发数
+  tlsScanConcurrency: 30
+
+  # 基准指纹缓存 + 快速比对（方案三）
+  # 使用 FNV-1a hash 算法预计算基准响应的指纹
+  # 碰撞时先用 hash 做 O(n) 快速比对，hash 相同直接判定为失败
+  # 只有 hash 不同时才做 O(n*m) 的编辑距离计算，大幅减少重量级计算
+  enableFingerprintCache: true
+
+  # 自适应分阶段采样（方案五）
+  # 替代固定采样排除，分三个阶段逐步增加采样数量：
+  #   阶段1: 采样 50 个 Host
+  #   阶段2: 采样 200 个 Host
+  #   阶段3: 采样 500 个 Host（即 responseSampleSize）
+  # 对明显无效的 IP 可以在阶段1就快速跳过
+  # WAF 拦截的响应不计入指纹比对，避免 WAF 干扰判断
+  enableAdaptiveSampling: true

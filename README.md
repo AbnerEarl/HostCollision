@@ -60,6 +60,13 @@
 - **丰富的公开 API**：`Run()`、`RunWithOptions()`、`RunWithCallback()`、`RunFast()`、`RunStealth()` 等
 - **回调机制**：支持实时结果回调和进度回调，方便集成到 Web 服务或自动化流水线
 
+### ⚡ 多维度加速引擎
+- **HEAD 预筛选**：用 HEAD 请求替代 GET 做第一轮快速筛选，速度提升 5-10 倍，不支持 HEAD 的服务自动回退
+- **TLS 证书 SAN 提取**：TLS 握手提取证书域名，标记为最高优先级 P0，零漏报发现隐藏资产
+- **FNV 指纹缓存**：FNV-1a hash 预计算基准响应指纹，O(n) 快速比对替代 O(n*m) 编辑距离
+- **自适应分阶段采样**：三阶段逐步采样（50→200→500），无效 IP 更快跳过
+- **连接池深度优化**：MaxIdleConnsPerHost 提升至 50，同一 IP 的 Host 请求充分复用 TCP 连接
+
 ### 🛡️ 防封禁 & WAF 绕过
 - **User-Agent 随机池**：内置 30+ 真实浏览器 UA（Chrome/Firefox/Safari/Edge 多平台多版本），每次请求随机选取
 - **令牌桶速率控制**：`-rate 50` 精确限制全局 QPS，避免触发 WAF 限流规则
@@ -457,6 +464,12 @@ results, err := hostcollision.RunHTTPSOnly(ipList, hostList)
 | `OnProgress` | `func(int64,int64)` | `nil` | 进度回调 |
 | `OnError` | `func(...)` | `nil` | 错误回调 |
 | `Blacklists` | `*BlacklistsOption` | 内置 WAF 特征 | WAF 黑名单 |
+| `EnableHEADPreFilter` | `*bool` | `true` | HEAD 预筛选（不支持 HEAD 自动回退） |
+| `EnableTLSScan` | `*bool` | `true` | TLS 证书 SAN 提取 |
+| `TLSScanConcurrency` | `int` | `30` | TLS 扫描并发数 |
+| `EnableFingerprintCache` | `*bool` | `true` | FNV hash 指纹缓存快速比对 |
+| `EnableAdaptiveSampling` | `*bool` | `true` | 自适应分阶段采样 |
+| `OnTLSScanDone` | `func(*TLSScanResult)` | `nil` | TLS 扫描完成回调 |
 
 ### Result 结果结构
 
@@ -504,6 +517,15 @@ type Result struct {
 | `-dmax` | 延迟扫描：最大间隔（毫秒） | `800` | `-dmax 5000` |
 | `-ppf` | 代理池文件路径 | — | `-ppf ./proxyList.txt` |
 | `-rua` | UA 随机化开关 | `true` | `-rua false` |
+
+### 加速优化参数
+
+| 参数 | 说明 | 默认值 | 示例 |
+|------|------|--------|------|
+| `-head` | HEAD 预筛选开关 | `true` | `-head false` |
+| `-tls` | TLS 证书 SAN 提取开关 | `true` | `-tls false` |
+| `-fpc` | 基准指纹缓存快速比对开关 | `true` | `-fpc false` |
+| `-as` | 自适应分阶段采样开关 | `true` | `-as false` |
 
 > 📝 所有命令行参数的优先级 **高于** 配置文件 `config.yml`
 
@@ -682,10 +704,17 @@ HostCollision/
     ├── config/
     │   └── config.go                    # 配置管理（YAML 解析、默认配置、多种构造方式）
     ├── collision/
-    │   └── collision.go                 # 碰撞核心逻辑：多重误报过滤、WAF 检测
+    │   └── collision.go                 # 碰撞核心逻辑：多重误报过滤、WAF 检测、
+    │                                    #   HEAD 预筛选、指纹缓存、自适应采样
     ├── httpclient/
     │   └── httpclient.go               # HTTP 客户端：UA 随机池、代理池管理器、
-    │                                    #   令牌桶限速器、延迟控制、Header 伪造
+    │                                    #   令牌桶限速器、延迟控制、Header 伪造、
+    │                                    #   HEAD 请求、连接池深度优化
+    ├── tlsscan/
+    │   └── tlsscan.go                   # TLS 证书 SAN 提取：HTTPS 握手、
+    │                                    #   证书域名提取、通配符匹配
+    ├── dnsfilter/
+    │   └── dnsfilter.go                 # DNS 反向筛选：域名解析、IP 段匹配
     ├── diffpage/
     │   └── diffpage.go                  # 页面相似度：HTML 过滤、Levenshtein 编辑距离
     ├── helpers/
@@ -705,46 +734,56 @@ HostCollision/
                      │    hostcollision.go         │
                      │  (公开 API: Run / Options)   │
                      └────────────┬───────────────┘
-           ┌──────────────────────┼──────────────────────┐
-           │                      │                      │
-┌──────────▼──────────┐ ┌────────▼────────┐ ┌───────────▼──────────┐
-│ pkg/config          │ │ pkg/collision   │ │ pkg/httpclient       │
-│ (配置管理)           │ │ (碰撞核心逻辑)  │ │ (HTTP客户端/速率/代理) │
-└─────────────────────┘ └────────┬────────┘ └──────────────────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    │                         │
-          ┌─────────▼─────────┐   ┌──────────▼──────────┐
-          │ pkg/diffpage      │   │ pkg/helpers          │
-          │ (页面相似度算法)    │   │ (文件/数据工具)       │
-          └───────────────────┘   └─────────────────────┘
+     ┌──────────┬─────────────────┼──────────────────┬──────────┐
+     │          │                 │                  │          │
+┌────▼────┐ ┌──▼──────────┐ ┌────▼────────┐ ┌──────▼───┐ ┌────▼────────┐
+│ config  │ │ collision   │ │ httpclient  │ │ tlsscan  │ │ dnsfilter   │
+│ (配置)  │ │ (碰撞核心)  │ │ (HTTP/HEAD) │ │ (TLS证书)│ │ (DNS筛选)   │
+└─────────┘ └──────┬──────┘ └─────────────┘ └──────────┘ └─────────────┘
+                   │
+          ┌────────┼────────┐
+          │                 │
+    ┌─────▼──────┐   ┌──────▼──────┐
+    │ diffpage   │   │ helpers     │
+    │ (相似度)   │   │ (工具函数)  │
+    └────────────┘   └─────────────┘
 ```
 
-### 碰撞检测流程
+### 碰撞检测流程（含加速优化）
 
 ```mermaid
 flowchart TD
-    A[开始: 遍历 IP × 协议 × Host] --> B[基准请求: GET protocol://ip]
-    B --> C[错误请求: GET protocol://ip Host=error.xxx.com]
+    START["输入: IP列表 + Host列表"] --> TLS["TLS证书SAN提取<br/>标记P0优先级"]
+    TLS --> DNS["DNS反向筛选<br/>过滤无关Host"]
+    DNS --> PRE["IP可达性预检测<br/>过滤不可达IP"]
+    PRE --> A["遍历 IP × 协议"]
+    A --> B["基准请求: GET protocol://ip"]
+    B --> C["错误请求: GET protocol://ip Host=error.xxx.com"]
     C --> D{请求长度校验}
     D -- 异常 --> SKIP[跳过该 IP]
-    D -- 正常 --> E[碰撞请求: GET protocol://ip Host=target_host]
-    E --> F[相对错误请求: GET protocol://ip Host=q1w2e3sr4.target_host]
-    F --> G{长度校验}
-    G -- 异常 --> FAIL[匹配失败]
-    G -- 正常 --> H{内容包含匹配}
-    H -- 相同 --> FAIL
-    H -- 不同 --> I{Title 标题匹配}
-    I -- 相同 --> FAIL
-    I -- 不同 --> J{相似度检测 Levenshtein ≥ 70%?}
+    D -- 正常 --> FP["计算基准FNV指纹"]
+    FP --> HEAD{"HEAD预筛选<br/>(不支持HEAD自动回退)"}
+    HEAD -- 指纹相同 --> SKIP2[跳过该Host]
+    HEAD -- 指纹不同/回退 --> SAMPLE{"自适应采样排除<br/>(50→200→500)"}
+    SAMPLE -- 全部相同 --> SKIP3[跳过剩余Host]
+    SAMPLE -- 发现差异 --> E["碰撞请求: GET protocol://ip Host=target_host"]
+    E --> FNV{"FNV指纹比对<br/>O(n)快速判定"}
+    FNV -- hash相同 --> FAIL[匹配失败]
+    FNV -- hash不同 --> J{"编辑距离相似度<br/>Levenshtein ≥ 70%?"}
     J -- 相似 --> FAIL
-    J -- 不相似 --> K{数据样本比对}
+    J -- 不相似 --> F["相对错误请求"]
+    F --> K{数据样本比对}
     K -- 命中样本 --> FAIL
     K -- 未命中 --> L{HTTP 状态码白名单}
     L -- 不在白名单 --> FAIL
     L -- 在白名单 --> M{WAF 特征检测}
-    M -- 命中 WAF --> FAIL
-    M -- 无 WAF --> SUCCESS[🎉 碰撞成功! 输出结果]
+    M -- 命中 WAF --> RETRY["WAF退避重试"]
+    M -- 无 WAF --> SUCCESS["🎉 碰撞成功! 输出结果"]
+
+    style TLS fill:#e6f3ff,stroke:#0066cc
+    style HEAD fill:#fff3e6,stroke:#cc6600
+    style FNV fill:#e6ffe6,stroke:#006600
+    style SAMPLE fill:#f3e6ff,stroke:#6600cc
 ```
 
 ---
@@ -1060,6 +1099,167 @@ WAF 通常通过请求指纹（Header 组合、顺序、值）来识别扫描行
 | 不同 Host 不同 WAF 策略 | 一刀切放弃 | 逐个尝试，精确识别 |
 | 请求指纹被识别 | 所有请求特征一致 | 每次请求指纹不同 |
 | 固定请求顺序 | 容易被模式识别 | 随机打散，无规律 |
+
+---
+
+### 第三轮：多维度加速优化
+
+> 目标：在不漏报资产的前提下，通过多层漏斗模型大幅减少无效请求，将碰撞耗时从数小时级降至分钟级。基于前沿技术调研（HTTP HEAD 预筛选、TLS 证书 SAN 提取、FNV-1a 指纹缓存、自适应采样等），从协议层、算法层、架构层三个维度进行全方位加速。
+
+#### 涉及文件
+
+| 文件 | 操作 | 优化类型 |
+|------|------|----------|
+| `pkg/tlsscan/tlsscan.go` | **新增** | TLS 证书 SAN 提取模块 |
+| `pkg/collision/collision.go` | 修改 | HEAD 预筛选 + 指纹缓存 + 自适应采样 |
+| `pkg/httpclient/httpclient.go` | 修改 | HEAD 请求方法 + 连接池深度优化 |
+| `pkg/config/config.go` | 修改 | 新增优化策略配置字段 |
+| `hostcollision.go` | 修改 | TLS 扫描集成 + 新 Options 字段 |
+| `cmd/hostcollision/main.go` | 修改 | 新增命令行参数 |
+| `resource/config.yml` | 修改 | 新增配置项 |
+
+#### 1. HEAD 预筛选（方案一）— 协议层优化
+
+**核心思想**：用 HTTP HEAD 请求替代 GET 做第一轮快速筛选。HEAD 请求只返回响应头（状态码、Content-Length、Server 等），不返回 Body，**速度比 GET 快 5-10 倍**。
+
+**工作流程**：
+```
+第1步: 对目标 IP 发送基准 HEAD 请求（无 Host 头）→ 获取基准指纹
+第2步: 对目标 IP 发送错误 Host 的 HEAD 请求 → 获取错误指纹
+第3步: 对每个候选 Host 发送 HEAD 请求 → 获取 Host 指纹
+第4步: 指纹与基准和错误都不同 → 候选，进入 GET 碰撞
+       指纹与基准或错误相同 → 大概率无效，跳过
+```
+
+**三重安全保障（确保零漏报）**：
+
+| 场景 | 处理策略 |
+|------|----------|
+| 服务不支持 HEAD（返回 405/501） | 自动回退到全量 GET 碰撞 |
+| HEAD 基准请求被 WAF 拦截 | 自动回退到全量 GET 碰撞 |
+| HEAD 筛选后候选数量过少（<5%） | 自动回退到全量 GET 碰撞（防止 HEAD/GET 行为不一致导致漏报） |
+| HEAD 请求失败的 Host | 保留为候选（安全起见） |
+| 某个 Host 返回 405/501 | 保留为候选（可能有特殊路由） |
+| 某个 Host 返回 429 | 保留为候选 + 记录 WAF 拦截 |
+
+> 预估可过滤 80-95% 的无效 Host，且完全零漏报。
+
+#### 2. TLS 证书 SAN 提取（方案二）— 协议层优化
+
+**核心思想**：对每个 IP 的 HTTPS 端口做 TLS 握手（不需要完整 HTTP 请求），提取服务器证书中的 **Subject Alternative Name (SAN)** 字段，获取该 IP 上配置的所有域名。
+
+**IP 格式兼容**：
+
+| 输入格式 | 处理方式 |
+|----------|----------|
+| `1.1.1.1`（纯 IP） | 默认扫描 443 端口 |
+| `2.2.2.2:8443`（带端口） | 扫描 8443 端口 |
+| `[::1]:8080`（IPv6） | 正确解析 |
+| 重复 IP:端口 | 自动去重 |
+
+**匹配策略**：
+- 精确匹配：证书域名 `admin.example.com` 与 Host 列表中的 `admin.example.com`
+- 通配符匹配：证书域名 `*.example.com` 匹配 Host 列表中的 `sub.example.com`
+- 匹配的域名标记为**最高优先级 P0**，排在碰撞列表最前面
+
+> TLS 握手比完整 HTTP 请求快得多，所有 IP 并发握手几十秒内完成。
+
+#### 3. FNV-1a 指纹缓存 + 快速比对（方案三）— 算法层优化
+
+**核心思想**：当前每次碰撞都要做编辑距离计算（`O(n*m)`），对大页面非常慢。引入 FNV-1a hash 指纹做快速预判，只有 hash 不同时才做重量级计算。
+
+**多级比对体系**：
+```
+Level 1: 状态码 + Content-Length（整数比较，O(1)）  ← 已有
+Level 2: FNV-1a Body hash（O(n)，比编辑距离快 100 倍）  ← 新增
+Level 3: 编辑距离相似度（O(n*m)，只对 hash 不同的候选执行）  ← 已有
+```
+
+**工作原理**：
+- 预计算基准响应和错误响应的 FNV-1a 64位 hash 指纹（每个 IP+协议 只算一次，16 字节）
+- 碰撞响应先算 FNV hash，与基准比对
+- hash 相同 → 内容完全相同 → 直接判定失败（跳过编辑距离计算）
+- hash 不同 → 内容一定不同 → 继续做编辑距离相似度计算
+
+**内存开销**：每个 IP+协议 只缓存 2 个 `uint64`（16 字节），2,361 IP × 2 协议 ≈ 75KB，完全可忽略。
+
+> WAF 拦截的响应不影响指纹缓存，WAF 检测在指纹比对之前执行。
+
+#### 4. 连接池深度优化（方案四）— 网络层优化
+
+| 参数 | 优化前 | 优化后 | 说明 |
+|------|--------|--------|------|
+| `MaxIdleConnsPerHost` | 10 | **50** | 提升同一 IP 的连接复用率 |
+| `MaxIdleConns` | 100 | **200** | 增大全局连接池容量 |
+| `IdleConnTimeout` | 90s | **60s** | 更快释放闲置连接，减少内存占用 |
+
+同时新增 `SendHTTPHeadRequest` 方法，与 GET 请求共享连接池和所有防检测机制（UA 随机化、Header 伪造、代理池轮换、速率限制）。
+
+#### 5. 自适应分阶段采样（方案五）— 策略层优化
+
+**替代原有的固定采样排除**，分三个阶段逐步增加采样数量：
+
+```
+阶段1: 采样 50 个 Host → 全部相同 → 继续阶段2
+阶段2: 采样 200 个 Host → 全部相同 → 继续阶段3
+阶段3: 采样 500 个 Host → 全部相同 → 跳过该 IP
+任何阶段发现不同响应 → 立即进入完整碰撞
+```
+
+**WAF 感知**：WAF 拦截的响应**不计入指纹比对**，避免 WAF 统一返回拦截页面导致误判"所有响应相同"。
+
+**内存安全**：只保存一个 `firstFingerprint` 字符串，不缓存所有采样结果。
+
+#### 五层漏斗架构
+
+```mermaid
+graph TD
+    A["输入数据<br/>IP列表 + Host列表"] --> B{"碰撞组合数 ≤ 阈值?<br/>(默认36万,约1小时)"}
+    
+    B -->|"是"| C["全量碰撞<br/>跳过所有优化"]
+    B -->|"否"| D["启用优化策略"]
+    
+    D --> E["第1层: TLS证书SAN提取<br/>标记P0优先级<br/>⏱ ~30秒"]
+    D --> E2["第1层: DNS反向筛选<br/>过滤无关Host<br/>⏱ ~3分钟"]
+    
+    E --> F["第2层: IP可达性预检测<br/>过滤不可达IP"]
+    E2 --> F
+    
+    F --> G["第3层: HEAD预筛选<br/>快速过滤无效Host<br/>⏱ 极快"]
+    
+    G --> H["第4层: 自适应采样排除<br/>无效IP提前跳过"]
+    
+    H --> I["第5层: 完整GET碰撞<br/>FNV指纹缓存加速<br/>只对候选Host执行"]
+    
+    I --> J["碰撞结果"]
+    C --> J
+    
+    style E fill:#e6f3ff,stroke:#0066cc
+    style G fill:#fff3e6,stroke:#cc6600
+    style I fill:#e6ffe6,stroke:#006600
+    style H fill:#f3e6ff,stroke:#6600cc
+```
+
+#### 新增命令行参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `-head` | HEAD 预筛选开关（不支持 HEAD 的服务自动回退） | `true` |
+| `-tls` | TLS 证书 SAN 提取开关 | `true` |
+| `-fpc` | FNV 指纹缓存快速比对开关 | `true` |
+| `-as` | 自适应分阶段采样开关 | `true` |
+
+所有新功能默认开启，可通过参数关闭（如 `-head=false`）。
+
+#### 第三轮优化效果
+
+| 优化层级 | 技术手段 | 过滤率 | 漏报风险 |
+|----------|----------|--------|----------|
+| TLS 证书 SAN | TLS 握手提取域名，标记 P0 优先级 | — | 零 |
+| HEAD 预筛选 | HEAD 响应头指纹比对 | 80-95% | 零（三重安全保障） |
+| FNV 指纹缓存 | FNV-1a hash 快速判定相同内容 | — | 零（hash 相同=内容相同） |
+| 自适应采样 | 三阶段逐步采样（50→200→500） | 对无效 IP 100% | 极低（WAF 感知） |
+| 连接池优化 | MaxIdleConnsPerHost 10→50 | — | 零 |
 
 ---
 

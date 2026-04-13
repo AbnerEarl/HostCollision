@@ -14,6 +14,7 @@ import (
 
 	"github.com/AbnerEarl/HostCollision/pkg/collision"
 	"github.com/AbnerEarl/HostCollision/pkg/config"
+	"github.com/AbnerEarl/HostCollision/pkg/dnsfilter"
 	"github.com/AbnerEarl/HostCollision/pkg/helpers"
 	"github.com/AbnerEarl/HostCollision/pkg/httpclient"
 	"github.com/AbnerEarl/HostCollision/pkg/progress"
@@ -56,6 +57,36 @@ func main() {
 	}
 	if opts.randomUA != "" {
 		cfg.AntiDetection.RandomUA = strings.TrimSpace(strings.ToLower(opts.randomUA)) != "false"
+	}
+
+	// 优化策略参数覆盖
+	if opts.enableDNSFilter != "" {
+		cfg.Optimization.EnableDNSFilter = strings.TrimSpace(strings.ToLower(opts.enableDNSFilter)) != "false"
+	}
+	if opts.dnsMatchMode != "" {
+		cfg.Optimization.DNSMatchMode = opts.dnsMatchMode
+	}
+	if opts.enableResponseElimination != "" {
+		cfg.Optimization.EnableResponseElimination = strings.TrimSpace(strings.ToLower(opts.enableResponseElimination)) != "false"
+	}
+	if opts.responseSampleSize > 0 {
+		cfg.Optimization.ResponseSampleSize = opts.responseSampleSize
+	}
+	if opts.fullScan != "" {
+		cfg.Optimization.FullScan = strings.TrimSpace(strings.ToLower(opts.fullScan)) != "false"
+	}
+	// 新增优化策略参数覆盖
+	if opts.enableHEADPreFilter != "" {
+		cfg.Optimization.EnableHEADPreFilter = strings.TrimSpace(strings.ToLower(opts.enableHEADPreFilter)) != "false"
+	}
+	if opts.enableTLSScan != "" {
+		cfg.Optimization.EnableTLSScan = strings.TrimSpace(strings.ToLower(opts.enableTLSScan)) != "false"
+	}
+	if opts.enableFingerprintCache != "" {
+		cfg.Optimization.EnableFingerprintCache = strings.TrimSpace(strings.ToLower(opts.enableFingerprintCache)) != "false"
+	}
+	if opts.enableAdaptiveSampling != "" {
+		cfg.Optimization.EnableAdaptiveSampling = strings.TrimSpace(strings.ToLower(opts.enableAdaptiveSampling)) != "false"
 	}
 
 	// 获取各项配置参数（命令行优先级高于配置文件）
@@ -176,6 +207,96 @@ func main() {
 		os.Exit(0)
 	}
 	fmt.Printf("预检测完成, %d 个IP可达\n", len(ipList))
+
+	// ===== 优化策略: DNS 反向筛选 + 自动全量扫描判断 =====
+	originalHostCount := len(hostList)
+	totalCombinations := int64(len(ipList)) * int64(len(scanProtocols)) * int64(len(hostList))
+
+	if cfg.Optimization.FullScan {
+		fmt.Println("======================优 化 策 略=======================")
+		fmt.Printf("[优化策略] 强制全量扫描模式, 碰撞组合数: %d\n", totalCombinations)
+	} else if totalCombinations <= cfg.Optimization.AutoFullScanThreshold {
+		fmt.Println("======================优 化 策 略=======================")
+		fmt.Printf("[优化策略] 碰撞组合数 %d ≤ 阈值 %d, 自动使用全量扫描\n",
+			totalCombinations, cfg.Optimization.AutoFullScanThreshold)
+	} else {
+		fmt.Println("======================优 化 策 略=======================")
+		fmt.Printf("[优化策略] 碰撞组合数 %d > 阈值 %d, 启用优化策略\n",
+			totalCombinations, cfg.Optimization.AutoFullScanThreshold)
+
+		// DNS 反向筛选
+		if cfg.Optimization.EnableDNSFilter {
+			fmt.Println("[优化策略] DNS 反向筛选: 开始...")
+
+			filterCfg := dnsfilter.DefaultFilterConfig()
+			filterCfg.MatchMode = dnsfilter.ParseMatchMode(cfg.Optimization.DNSMatchMode)
+			if cfg.Optimization.DNSConcurrency > 0 {
+				filterCfg.Concurrency = cfg.Optimization.DNSConcurrency
+			}
+			filterCfg.OutputLog = outputErrorLog
+
+			filterResult := dnsfilter.Filter(ipList, hostList, filterCfg)
+
+			effectiveHosts := filterResult.GetEffectiveHosts()
+
+			fmt.Printf("[优化策略] DNS 反向筛选完成: 匹配模式 %s, "+
+				"总计 %d → 有效 %d (匹配IP段 %d + 解析失败 %d), 过滤 %d, 耗时 %v\n",
+				dnsfilter.MatchModeString(filterCfg.MatchMode),
+				filterResult.TotalHosts,
+				len(effectiveHosts),
+				filterResult.MatchedCount,
+				filterResult.UnresolvedCount,
+				filterResult.UnmatchedCount,
+				filterResult.Duration.Round(time.Millisecond),
+			)
+
+			if len(effectiveHosts) > 0 {
+				hostList = effectiveHosts
+			} else {
+				fmt.Println("[优化策略] DNS 筛选后无有效 Host, 回退到全量扫描")
+			}
+		} else {
+			fmt.Println("[优化策略] DNS 反向筛选: 已关闭")
+		}
+
+		// 响应快速排除状态输出
+		if cfg.Optimization.EnableResponseElimination {
+			if cfg.Optimization.EnableAdaptiveSampling {
+				fmt.Printf("[优化策略] 响应快速排除: 已启用(自适应分阶段采样), 最大采样数 %d\n", cfg.Optimization.ResponseSampleSize)
+			} else {
+				fmt.Printf("[优化策略] 响应快速排除: 已启用, 采样数 %d\n", cfg.Optimization.ResponseSampleSize)
+			}
+		} else {
+			fmt.Println("[优化策略] 响应快速排除: 已关闭")
+		}
+
+		// HEAD 预筛选状态输出
+		if cfg.Optimization.EnableHEADPreFilter {
+			fmt.Println("[优化策略] HEAD 预筛选: 已启用(不支持HEAD的服务自动回退到GET)")
+		} else {
+			fmt.Println("[优化策略] HEAD 预筛选: 已关闭")
+		}
+
+		// TLS 证书 SAN 提取状态输出
+		if cfg.Optimization.EnableTLSScan {
+			fmt.Println("[优化策略] TLS 证书 SAN 提取: 已启用")
+		} else {
+			fmt.Println("[优化策略] TLS 证书 SAN 提取: 已关闭")
+		}
+
+		// 基准指纹缓存状态输出
+		if cfg.Optimization.EnableFingerprintCache {
+			fmt.Println("[优化策略] 基准指纹缓存(FNV hash): 已启用")
+		} else {
+			fmt.Println("[优化策略] 基准指纹缓存(FNV hash): 已关闭")
+		}
+	}
+
+	if len(hostList) != originalHostCount {
+		fmt.Printf("[优化策略] Host 列表: %d → %d (减少 %.1f%%)\n",
+			originalHostCount, len(hostList),
+			float64(originalHostCount-len(hostList))/float64(originalHostCount)*100)
+	}
 
 	// 控制台进度条（使用预检测后的IP数量计算）
 	requestTotal := int64(len(ipList) * len(scanProtocols) * len(hostList))
@@ -320,6 +441,16 @@ type cliOptions struct {
 	delayMax      int
 	proxyPoolFile string
 	randomUA      string
+	// 优化策略相关
+	enableDNSFilter           string
+	dnsMatchMode              string
+	enableResponseElimination string
+	responseSampleSize        int
+	fullScan                  string
+	enableHEADPreFilter       string
+	enableTLSScan             string
+	enableFingerprintCache    string
+	enableAdaptiveSampling    string
 }
 
 func parseFlags() *cliOptions {
@@ -340,6 +471,16 @@ func parseFlags() *cliOptions {
 	flag.IntVar(&opts.delayMax, "dmax", -1, "延迟扫描最大间隔(毫秒)<例如:3000>")
 	flag.StringVar(&opts.proxyPoolFile, "ppf", "", "代理池文件路径<例如:./dataSource/proxyList.txt>")
 	flag.StringVar(&opts.randomUA, "rua", "", "是否启用UA随机化<例如:true 启用/false 关闭>")
+	// 优化策略相关参数
+	flag.StringVar(&opts.enableDNSFilter, "dns", "", "是否启用DNS反向筛选<例如:true 启用/false 关闭>(默认:true)")
+	flag.StringVar(&opts.dnsMatchMode, "dmm", "", "DNS匹配模式<例如:16(/16网段)/24(/24网段)/exact(精确匹配)>(默认:16)")
+	flag.StringVar(&opts.enableResponseElimination, "re", "", "是否启用响应快速排除<例如:true 启用/false 关闭>(默认:true)")
+	flag.IntVar(&opts.responseSampleSize, "rss", 0, "响应快速排除采样Host数量(默认:500)")
+	flag.StringVar(&opts.fullScan, "full", "", "是否强制全量扫描,忽略所有优化策略<例如:true 启用/false 关闭>(默认:false)")
+	flag.StringVar(&opts.enableHEADPreFilter, "head", "", "是否启用HEAD预筛选<例如:true/false>(默认:true)")
+	flag.StringVar(&opts.enableTLSScan, "tls", "", "是否启用TLS证书SAN提取<例如:true/false>(默认:true)")
+	flag.StringVar(&opts.enableFingerprintCache, "fpc", "", "是否启用基准指纹缓存快速比对<例如:true/false>(默认:true)")
+	flag.StringVar(&opts.enableAdaptiveSampling, "as", "", "是否启用自适应分阶段采样<例如:true/false>(默认:true)")
 
 	flag.Usage = func() {
 		fmt.Println("=======================使 用 文 档=======================")
@@ -359,6 +500,17 @@ func parseFlags() *cliOptions {
 		fmt.Println("-dmax                               延迟扫描最大间隔(毫秒)<例如:3000>")
 		fmt.Println("-ppf                                代理池文件路径<例如:./dataSource/proxyList.txt>")
 		fmt.Println("-rua                                是否启用UA随机化<例如:true 启用/false 关闭>")
+		fmt.Println("")
+		fmt.Println("=====================优 化 策 略 参 数=====================")
+		fmt.Println("-dns                                是否启用DNS反向筛选<例如:true/false>(默认:true)")
+		fmt.Println("-dmm                                DNS匹配模式<例如:16/24/exact>(默认:16)")
+		fmt.Println("-re                                 是否启用响应快速排除<例如:true/false>(默认:true)")
+		fmt.Println("-rss                                响应快速排除采样Host数量(默认:500)")
+		fmt.Println("-full                               是否强制全量扫描<例如:true/false>(默认:false)")
+		fmt.Println("-head                               是否启用HEAD预筛选<例如:true/false>(默认:true)")
+		fmt.Println("-tls                                是否启用TLS证书SAN提取<例如:true/false>(默认:true)")
+		fmt.Println("-fpc                                是否启用基准指纹缓存快速比对<例如:true/false>(默认:true)")
+		fmt.Println("-as                                 是否启用自适应分阶段采样<例如:true/false>(默认:true)")
 	}
 
 	flag.Parse()

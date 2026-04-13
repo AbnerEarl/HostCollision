@@ -28,8 +28,10 @@ import (
 
 	"github.com/AbnerEarl/HostCollision/pkg/collision"
 	"github.com/AbnerEarl/HostCollision/pkg/config"
+	"github.com/AbnerEarl/HostCollision/pkg/dnsfilter"
 	"github.com/AbnerEarl/HostCollision/pkg/helpers"
 	"github.com/AbnerEarl/HostCollision/pkg/httpclient"
+	"github.com/AbnerEarl/HostCollision/pkg/tlsscan"
 )
 
 // Options 碰撞任务配置选项
@@ -106,6 +108,99 @@ type Options struct {
 
 	// OnError 错误回调函数（可选）
 	OnError func(protocol, ip, host, message string)
+
+	// ========== 优化策略选项 ==========
+
+	// EnableDNSFilter 是否启用 DNS 反向筛选（默认开启）
+	// 通过 DNS 解析过滤与目标 IP 无关的 Host，大幅减少无效碰撞请求
+	EnableDNSFilter *bool
+
+	// DNSMatchMode DNS 匹配模式
+	// 可选值: "16"(默认/16网段), "24"(/24网段), "exact"(精确匹配)
+	DNSMatchMode string
+
+	// DNSConcurrency DNS 解析并发数（默认50）
+	DNSConcurrency int
+
+	// EnableResponseElimination 是否启用响应快速排除（默认开启）
+	// 对每个 IP 碰撞前 N 个 Host 后，如果响应全部相同则跳过该 IP 剩余 Host
+	EnableResponseElimination *bool
+
+	// ResponseSampleSize 响应快速排除的采样 Host 数量（默认500）
+	// 仅当 Host 总量大于此值时才启用采样排除
+	ResponseSampleSize int
+
+	// FullScan 是否强制全量扫描（忽略所有优化策略）
+	FullScan bool
+
+	// AutoFullScanThreshold 自动全量扫描阈值
+	// 当预估碰撞组合数低于此值时自动切换为全量扫描（默认360000，约1小时可完成）
+	// 设为 0 表示禁用自动全量扫描
+	AutoFullScanThreshold int64
+
+	// EnableHEADPreFilter 是否启用 HEAD 预筛选（默认开启）
+	// 对每个 IP 先发送 HEAD 请求获取响应头指纹，只有指纹与基准不同的 Host 才进入 GET 碰撞
+	// 如果服务不支持 HEAD 方法，会自动回退到 GET 碰撞
+	EnableHEADPreFilter *bool
+
+	// EnableTLSScan 是否启用 TLS 证书 SAN 提取（默认开启）
+	// 对 HTTPS 端口做 TLS 握手，提取证书中的域名列表，标记为最高优先级
+	EnableTLSScan *bool
+
+	// TLSScanConcurrency TLS 扫描并发数（默认30）
+	TLSScanConcurrency int
+
+	// EnableFingerprintCache 是否启用基准指纹缓存快速比对（默认开启）
+	// 使用 FNV hash 指纹做快速比对，只有 hash 不同时才做编辑距离计算
+	EnableFingerprintCache *bool
+
+	// EnableAdaptiveSampling 是否启用自适应分阶段采样（默认开启）
+	// 分阶段逐步增加采样数量，对明显无效的 IP 更快跳过
+	EnableAdaptiveSampling *bool
+
+	// OnDNSFilterDone DNS 筛选完成时的回调函数（可选）
+	OnDNSFilterDone func(result *DNSFilterResult)
+
+	// OnTLSScanDone TLS 证书扫描完成时的回调函数（可选）
+	OnTLSScanDone func(result *TLSScanResult)
+}
+
+// TLSScanResult TLS 证书扫描结果摘要（用于回调通知）
+type TLSScanResult struct {
+	ScannedCount int           // 成功扫描的 IP 数量
+	FailedCount  int           // 扫描失败的 IP 数量
+	CertDomains  int           // 提取到的证书域名数量
+	MatchedHosts int           // 与 Host 列表匹配的域名数量
+	Duration     time.Duration // 扫描耗时
+}
+
+// String 返回 TLS 扫描结果的可读字符串
+func (r *TLSScanResult) String() string {
+	return fmt.Sprintf(
+		"TLS证书扫描: 成功%d, 失败%d, 提取域名%d, 匹配Host%d, 耗时%v",
+		r.ScannedCount, r.FailedCount, r.CertDomains,
+		r.MatchedHosts, r.Duration.Round(time.Millisecond),
+	)
+}
+
+// DNSFilterResult DNS 筛选结果摘要（用于回调通知）
+type DNSFilterResult struct {
+	TotalHosts      int           // 总 Host 数
+	MatchedCount    int           // 匹配目标 IP 段的 Host 数
+	UnresolvedCount int           // DNS 解析失败的 Host 数
+	UnmatchedCount  int           // 无关 Host 数
+	EffectiveCount  int           // 有效 Host 数（Matched + Unresolved）
+	FilteredCount   int           // 被过滤的 Host 数
+	Duration        time.Duration // DNS 筛选耗时
+}
+
+// String 返回 DNS 筛选结果的可读字符串
+func (r *DNSFilterResult) String() string {
+	return fmt.Sprintf(
+		"DNS筛选: 总计%d, 匹配IP段%d, 解析失败%d, 无关%d, 有效%d, 过滤%d, 耗时%v",
+		r.TotalHosts, r.MatchedCount, r.UnresolvedCount, r.UnmatchedCount,
+		r.EffectiveCount, r.FilteredCount, r.Duration.Round(time.Millisecond),
+	)
 }
 
 // BlacklistsOption WAF 黑名单配置选项
@@ -138,6 +233,11 @@ type Result struct {
 func (r *Result) String() string {
 	return fmt.Sprintf("协议:%s, ip:%s, host:%s, title:%s, 数据包大小:%d, 状态码:%d",
 		r.Protocol, r.IP, r.Host, r.Title, r.MatchContentLen, r.MatchStatusCode)
+}
+
+// boolPtr 返回 bool 值的指针（用于区分"未设置"和"设置为false"）
+func boolPtr(b bool) *bool {
+	return &b
 }
 
 // DefaultOptions 返回一套合理的默认配置选项
@@ -179,6 +279,23 @@ func DefaultOptions() *Options {
 			},
 			HTTPXPoweredBy: []string{"waf"},
 		},
+		// 优化策略默认值
+		EnableDNSFilter:           boolPtr(true),
+		DNSMatchMode:              "16",
+		DNSConcurrency:            50,
+		EnableResponseElimination: boolPtr(true),
+		ResponseSampleSize:        500,
+		FullScan:                  false,
+		AutoFullScanThreshold:     360000,
+		// 方案一: HEAD 预筛选（默认开启）
+		EnableHEADPreFilter: boolPtr(true),
+		// 方案二: TLS 证书 SAN 提取（默认开启）
+		EnableTLSScan:      boolPtr(true),
+		TLSScanConcurrency: 30,
+		// 方案三: 基准指纹缓存（默认开启）
+		EnableFingerprintCache: boolPtr(true),
+		// 方案五: 自适应分阶段采样（默认开启）
+		EnableAdaptiveSampling: boolPtr(true),
 	}
 }
 
@@ -190,6 +307,144 @@ func DefaultOptions() *Options {
 // 返回碰撞成功的结果列表和可能的错误
 func Run(ipList, hostList []string) ([]*Result, error) {
 	return RunWithOptions(ipList, hostList, DefaultOptions())
+}
+
+// applyOptimizations 应用优化策略，返回优化后的 hostList
+// 包括: TLS 证书 SAN 提取、DNS 反向筛选、自动全量扫描判断
+func applyOptimizations(ipList, hostList []string, opts *Options) []string {
+	// 计算预估碰撞组合数
+	totalCombinations := int64(len(ipList)) * int64(len(opts.Protocols)) * int64(len(hostList))
+
+	// 强制全量扫描模式
+	if opts.FullScan {
+		fmt.Printf("[优化策略] 强制全量扫描模式, 碰撞组合数: %d\n", totalCombinations)
+		return hostList
+	}
+
+	// 自动全量扫描: 数据量较小时（预估1小时内可完成），自动使用全量扫描
+	threshold := opts.AutoFullScanThreshold
+	if threshold <= 0 {
+		threshold = 360000 // 默认阈值
+	}
+	if totalCombinations <= threshold {
+		fmt.Printf("[优化策略] 碰撞组合数 %d ≤ 阈值 %d, 自动使用全量扫描\n",
+			totalCombinations, threshold)
+		return hostList
+	}
+
+	fmt.Printf("[优化策略] 碰撞组合数 %d > 阈值 %d, 启用优化策略\n",
+		totalCombinations, threshold)
+
+	// ===== 方案二: TLS 证书 SAN 提取 =====
+	// 对 HTTPS 端口做 TLS 握手，提取证书中的域名列表
+	// 匹配的域名标记为最高优先级（排在 Host 列表最前面）
+	enableTLS := opts.EnableTLSScan == nil || *opts.EnableTLSScan
+	if enableTLS {
+		fmt.Println("[优化策略] TLS 证书 SAN 提取: 开始...")
+
+		scanCfg := tlsscan.DefaultScanConfig()
+		if opts.TLSScanConcurrency > 0 {
+			scanCfg.Concurrency = opts.TLSScanConcurrency
+		}
+		scanCfg.OutputLog = opts.OutputErrorLog
+
+		scanResult := tlsscan.ScanIPs(ipList, hostList, scanCfg)
+
+		// 回调通知
+		if opts.OnTLSScanDone != nil {
+			opts.OnTLSScanDone(&TLSScanResult{
+				ScannedCount: scanResult.ScannedCount,
+				FailedCount:  scanResult.FailedCount,
+				CertDomains:  len(scanResult.CertDomains),
+				MatchedHosts: len(scanResult.MatchedHosts),
+				Duration:     scanResult.Duration,
+			})
+		}
+
+		fmt.Printf("[优化策略] TLS 证书 SAN 提取完成: 成功扫描 %d 个IP, "+
+			"提取域名 %d, 匹配Host %d, 耗时 %v\n",
+			scanResult.ScannedCount,
+			len(scanResult.CertDomains),
+			len(scanResult.MatchedHosts),
+			scanResult.Duration.Round(time.Millisecond),
+		)
+
+		// 将匹配的 Host 排到列表最前面（最高优先级）
+		if len(scanResult.MatchedHosts) > 0 {
+			matchedSet := make(map[string]bool, len(scanResult.MatchedHosts))
+			for _, h := range scanResult.MatchedHosts {
+				matchedSet[strings.ToLower(h)] = true
+			}
+
+			// 分离匹配和未匹配的 Host
+			var priorityHosts, otherHosts []string
+			for _, h := range hostList {
+				if matchedSet[strings.ToLower(h)] {
+					priorityHosts = append(priorityHosts, h)
+				} else {
+					otherHosts = append(otherHosts, h)
+				}
+			}
+
+			// 重组列表：匹配的在前，其他的在后
+			hostList = make([]string, 0, len(priorityHosts)+len(otherHosts))
+			hostList = append(hostList, priorityHosts...)
+			hostList = append(hostList, otherHosts...)
+
+			fmt.Printf("[优化策略] TLS 证书匹配: %d 个Host标记为最高优先级(P0)\n",
+				len(priorityHosts))
+		}
+	}
+
+	// ===== DNS 反向筛选 =====
+	enableDNS := opts.EnableDNSFilter == nil || *opts.EnableDNSFilter
+	if enableDNS {
+		fmt.Println("[优化策略] DNS 反向筛选: 开始...")
+
+		filterCfg := dnsfilter.DefaultFilterConfig()
+		filterCfg.MatchMode = dnsfilter.ParseMatchMode(opts.DNSMatchMode)
+		if opts.DNSConcurrency > 0 {
+			filterCfg.Concurrency = opts.DNSConcurrency
+		}
+		filterCfg.OutputLog = opts.OutputErrorLog
+
+		filterResult := dnsfilter.Filter(ipList, hostList, filterCfg)
+
+		// 回调通知
+		if opts.OnDNSFilterDone != nil {
+			opts.OnDNSFilterDone(&DNSFilterResult{
+				TotalHosts:      filterResult.TotalHosts,
+				MatchedCount:    filterResult.MatchedCount,
+				UnresolvedCount: filterResult.UnresolvedCount,
+				UnmatchedCount:  filterResult.UnmatchedCount,
+				EffectiveCount:  filterResult.MatchedCount + filterResult.UnresolvedCount,
+				FilteredCount:   filterResult.UnmatchedCount,
+				Duration:        filterResult.Duration,
+			})
+		}
+
+		// 获取有效 Host（匹配 + 解析失败）
+		effectiveHosts := filterResult.GetEffectiveHosts()
+
+		fmt.Printf("[优化策略] DNS 反向筛选完成: 匹配模式 %s, "+
+			"总计 %d → 有效 %d (匹配IP段 %d + 解析失败 %d), 过滤 %d, 耗时 %v\n",
+			dnsfilter.MatchModeString(filterCfg.MatchMode),
+			filterResult.TotalHosts,
+			len(effectiveHosts),
+			filterResult.MatchedCount,
+			filterResult.UnresolvedCount,
+			filterResult.UnmatchedCount,
+			filterResult.Duration.Round(time.Millisecond),
+		)
+
+		if len(effectiveHosts) > 0 {
+			hostList = effectiveHosts
+		} else {
+			fmt.Println("[优化策略] DNS 筛选后无有效 Host, 回退到全量扫描")
+		}
+	}
+
+	return hostList
 }
 
 // RunWithOptions 使用自定义配置执行 Host 碰撞
@@ -249,6 +504,12 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 	ipList = collision.PreCheckIPs(ipList, opts.Protocols, opts.OutputErrorLog)
 	if len(ipList) == 0 {
 		return nil, fmt.Errorf("所有IP均不可达")
+	}
+
+	// 应用优化策略（DNS 筛选 + 自动全量扫描判断）
+	hostList = applyOptimizations(ipList, hostList, opts)
+	if len(hostList) == 0 {
+		return nil, fmt.Errorf("优化筛选后 Host 列表为空")
 	}
 
 	// 请求计数器
@@ -386,6 +647,12 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 	ipList = collision.PreCheckIPs(ipList, opts.Protocols, opts.OutputErrorLog)
 	if len(ipList) == 0 {
 		return fmt.Errorf("所有IP均不可达")
+	}
+
+	// 应用优化策略
+	hostList = applyOptimizations(ipList, hostList, opts)
+	if len(hostList) == 0 {
+		return fmt.Errorf("优化筛选后 Host 列表为空")
 	}
 
 	var numOfRequest int64
@@ -602,6 +869,46 @@ func optionsToConfig(opts *Options) *config.Config {
 		if opts.Blacklists.HTTPXPoweredBy != nil {
 			cfg.Blacklists.HTTPXPoweredBy = opts.Blacklists.HTTPXPoweredBy
 		}
+	}
+
+	// 优化策略配置
+	if opts.EnableDNSFilter != nil {
+		cfg.Optimization.EnableDNSFilter = *opts.EnableDNSFilter
+	}
+	if opts.DNSMatchMode != "" {
+		cfg.Optimization.DNSMatchMode = opts.DNSMatchMode
+	}
+	if opts.DNSConcurrency > 0 {
+		cfg.Optimization.DNSConcurrency = opts.DNSConcurrency
+	}
+	if opts.EnableResponseElimination != nil {
+		cfg.Optimization.EnableResponseElimination = *opts.EnableResponseElimination
+	}
+	if opts.ResponseSampleSize > 0 {
+		cfg.Optimization.ResponseSampleSize = opts.ResponseSampleSize
+	}
+	cfg.Optimization.FullScan = opts.FullScan
+	if opts.AutoFullScanThreshold > 0 {
+		cfg.Optimization.AutoFullScanThreshold = opts.AutoFullScanThreshold
+	}
+	// 方案一: HEAD 预筛选
+	if opts.EnableHEADPreFilter != nil {
+		cfg.Optimization.EnableHEADPreFilter = *opts.EnableHEADPreFilter
+	}
+	// 方案二: TLS 证书 SAN 提取
+	if opts.EnableTLSScan != nil {
+		cfg.Optimization.EnableTLSScan = *opts.EnableTLSScan
+	}
+	if opts.TLSScanConcurrency > 0 {
+		cfg.Optimization.TLSScanConcurrency = opts.TLSScanConcurrency
+	}
+	// 方案三: 基准指纹缓存
+	if opts.EnableFingerprintCache != nil {
+		cfg.Optimization.EnableFingerprintCache = *opts.EnableFingerprintCache
+	}
+	// 方案五: 自适应分阶段采样
+	if opts.EnableAdaptiveSampling != nil {
+		cfg.Optimization.EnableAdaptiveSampling = *opts.EnableAdaptiveSampling
 	}
 
 	return cfg

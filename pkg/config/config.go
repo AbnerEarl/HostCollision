@@ -22,6 +22,49 @@ type Config struct {
 	Blacklists                 BlacklistsConfig    `yaml:"blacklists"`
 	DataSample                 DataSampleConfig    `yaml:"dataSample"`
 	AntiDetection              AntiDetectionConfig `yaml:"antiDetection"`
+	Optimization               OptimizationConfig  `yaml:"optimization"`
+}
+
+// OptimizationConfig 优化策略配置
+type OptimizationConfig struct {
+	// EnableDNSFilter 是否启用 DNS 反向筛选（默认开启）
+	EnableDNSFilter bool `yaml:"enableDNSFilter"`
+	// DNSMatchMode DNS 匹配模式: "16"(默认/16网段), "24"(/24网段), "exact"(精确匹配)
+	DNSMatchMode string `yaml:"dnsMatchMode"`
+	// DNSConcurrency DNS 解析并发数
+	DNSConcurrency int `yaml:"dnsConcurrency"`
+	// EnableResponseElimination 是否启用响应快速排除（默认开启）
+	EnableResponseElimination bool `yaml:"enableResponseElimination"`
+	// ResponseSampleSize 响应快速排除的采样 Host 数量（默认500）
+	ResponseSampleSize int `yaml:"responseSampleSize"`
+	// FullScan 是否强制全量扫描（忽略所有优化策略）
+	FullScan bool `yaml:"fullScan"`
+	// AutoFullScanThreshold 自动全量扫描阈值（预估碰撞组合数低于此值时自动全量扫描）
+	// 默认值基于 1 小时可完成的碰撞量计算
+	AutoFullScanThreshold int64 `yaml:"autoFullScanThreshold"`
+
+	// ===== 方案一: HEAD 预筛选 =====
+	// EnableHEADPreFilter 是否启用 HEAD 预筛选（默认开启）
+	// 对每个 IP 先发送 HEAD 请求获取响应头指纹，只有指纹与基准不同的 Host 才进入 GET 碰撞
+	// 注意: 如果服务不支持 HEAD 方法（返回 405/501），会自动回退到 GET 碰撞
+	EnableHEADPreFilter bool `yaml:"enableHEADPreFilter"`
+
+	// ===== 方案二: TLS 证书 SAN 提取 =====
+	// EnableTLSScan 是否启用 TLS 证书 SAN 提取（默认开启）
+	// 对 HTTPS 端口做 TLS 握手，提取证书中的域名列表，标记为最高优先级
+	EnableTLSScan bool `yaml:"enableTLSScan"`
+	// TLSScanConcurrency TLS 扫描并发数
+	TLSScanConcurrency int `yaml:"tlsScanConcurrency"`
+
+	// ===== 方案三: 基准指纹缓存 + 快速比对 =====
+	// EnableFingerprintCache 是否启用基准指纹缓存快速比对（默认开启）
+	// 使用 hash 指纹做快速比对，只有 hash 不同时才做编辑距离计算
+	EnableFingerprintCache bool `yaml:"enableFingerprintCache"`
+
+	// ===== 方案五: 自适应分阶段采样 =====
+	// EnableAdaptiveSampling 是否启用自适应分阶段采样（默认开启）
+	// 先采样少量 Host，逐步增加采样数量，对明显无效的 IP 更快跳过
+	EnableAdaptiveSampling bool `yaml:"enableAdaptiveSampling"`
 }
 
 // HTTPConfig HTTP 请求相关配置
@@ -206,6 +249,25 @@ func DefaultConfig() *Config {
 				MinMs:   200,
 				MaxMs:   800,
 			},
+		},
+		Optimization: OptimizationConfig{
+			EnableDNSFilter:           true,
+			DNSMatchMode:              "16",
+			DNSConcurrency:            50,
+			EnableResponseElimination: true,
+			ResponseSampleSize:        500,
+			FullScan:                  false,
+			// 默认阈值: 按100QPS计算，1小时可完成 100*3600=360000 次请求
+			AutoFullScanThreshold: 360000,
+			// 方案一: HEAD 预筛选（默认开启）
+			EnableHEADPreFilter: true,
+			// 方案二: TLS 证书 SAN 提取（默认开启）
+			EnableTLSScan:      true,
+			TLSScanConcurrency: 30,
+			// 方案三: 基准指纹缓存（默认开启）
+			EnableFingerprintCache: true,
+			// 方案五: 自适应分阶段采样（默认开启）
+			EnableAdaptiveSampling: true,
 		},
 	}
 }

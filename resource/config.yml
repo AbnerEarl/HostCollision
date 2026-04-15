@@ -192,7 +192,7 @@ optimization:
 
   # 响应快速排除的采样 Host 数量
   # 仅当 Host 总量大于此值时才启用采样排除
-  responseSampleSize: 500
+responseSampleSize: 50
 
   # 是否强制全量扫描（忽略所有优化策略）
   fullScan: false
@@ -228,7 +228,18 @@ optimization:
   # 替代固定采样排除，分三个阶段逐步增加采样数量：
   #   阶段1: 采样 50 个 Host
   #   阶段2: 采样 200 个 Host
-  #   阶段3: 采样 500 个 Host（即 responseSampleSize）
+#   阶段3: 采样 50 个 Host（即 responseSampleSize）
   # 对明显无效的 IP 可以在阶段1就快速跳过
   # WAF 拦截的响应不计入指纹比对，避免 WAF 干扰判断
   enableAdaptiveSampling: true
+
+  # 万能响应IP检测（方案六）
+  # 当一个 IP 对大量不同 Host 都碰撞成功时，判定为"万能响应"IP
+  # 这类 IP 通常是默认虚拟主机、通配符配置、或者对任何 Host 头都返回相同/相似内容的服务器
+  # 检测到后会自动回溯清除该 IP 的所有碰撞结果，并跳过剩余 Host
+  enableCatchAllDetection: true
+  # 万能响应IP判定阈值
+  # 当一个 IP+协议 维度碰撞成功的 Host 数量超过此值时，判定为万能响应IP
+  # 建议值: 10（正常情况下一个 IP 不太可能有超过 10 个不同的有效 Host 碰撞成功）
+  # 如果业务场景中确实存在单 IP 多 Host 的情况，可适当调大此值
+  catchAllThreshold: 10

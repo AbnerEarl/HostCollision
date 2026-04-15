@@ -88,6 +88,12 @@ func main() {
 	if opts.enableAdaptiveSampling != "" {
 		cfg.Optimization.EnableAdaptiveSampling = strings.TrimSpace(strings.ToLower(opts.enableAdaptiveSampling)) != "false"
 	}
+	if opts.enableCatchAllDetection != "" {
+		cfg.Optimization.EnableCatchAllDetection = strings.TrimSpace(strings.ToLower(opts.enableCatchAllDetection)) != "false"
+	}
+	if opts.catchAllThreshold > 0 {
+		cfg.Optimization.CatchAllThreshold = opts.catchAllThreshold
+	}
 
 	// 获取各项配置参数（命令行优先级高于配置文件）
 	scanProtocols := getScanProtocols(opts, cfg)
@@ -290,6 +296,17 @@ func main() {
 		} else {
 			fmt.Println("[优化策略] 基准指纹缓存(FNV hash): 已关闭")
 		}
+
+		// 万能响应IP检测状态输出
+		if cfg.Optimization.EnableCatchAllDetection {
+			threshold := cfg.Optimization.CatchAllThreshold
+			if threshold <= 0 {
+				threshold = 10
+			}
+			fmt.Printf("[优化策略] 万能响应IP检测: 已启用, 阈值 %d\n", threshold)
+		} else {
+			fmt.Println("[优化策略] 万能响应IP检测: 已关闭")
+		}
 	}
 
 	if len(hostList) != originalHostCount {
@@ -451,6 +468,8 @@ type cliOptions struct {
 	enableTLSScan             string
 	enableFingerprintCache    string
 	enableAdaptiveSampling    string
+	enableCatchAllDetection   string
+	catchAllThreshold         int
 }
 
 func parseFlags() *cliOptions {
@@ -475,12 +494,14 @@ func parseFlags() *cliOptions {
 	flag.StringVar(&opts.enableDNSFilter, "dns", "", "是否启用DNS反向筛选<例如:true 启用/false 关闭>(默认:true)")
 	flag.StringVar(&opts.dnsMatchMode, "dmm", "", "DNS匹配模式<例如:16(/16网段)/24(/24网段)/exact(精确匹配)>(默认:16)")
 	flag.StringVar(&opts.enableResponseElimination, "re", "", "是否启用响应快速排除<例如:true 启用/false 关闭>(默认:true)")
-	flag.IntVar(&opts.responseSampleSize, "rss", 0, "响应快速排除采样Host数量(默认:500)")
+	flag.IntVar(&opts.responseSampleSize, "rss", 0, "响应快速排除采样Host数量(默认:50)")
 	flag.StringVar(&opts.fullScan, "full", "", "是否强制全量扫描,忽略所有优化策略<例如:true 启用/false 关闭>(默认:false)")
 	flag.StringVar(&opts.enableHEADPreFilter, "head", "", "是否启用HEAD预筛选<例如:true/false>(默认:true)")
 	flag.StringVar(&opts.enableTLSScan, "tls", "", "是否启用TLS证书SAN提取<例如:true/false>(默认:true)")
 	flag.StringVar(&opts.enableFingerprintCache, "fpc", "", "是否启用基准指纹缓存快速比对<例如:true/false>(默认:true)")
 	flag.StringVar(&opts.enableAdaptiveSampling, "as", "", "是否启用自适应分阶段采样<例如:true/false>(默认:true)")
+	flag.StringVar(&opts.enableCatchAllDetection, "catchall", "", "是否启用万能响应IP检测<例如:true/false>(默认:true)")
+	flag.IntVar(&opts.catchAllThreshold, "cat", 0, "万能响应IP判定阈值(默认:10)")
 
 	flag.Usage = func() {
 		fmt.Println("=======================使 用 文 档=======================")
@@ -511,6 +532,8 @@ func parseFlags() *cliOptions {
 		fmt.Println("-tls                                是否启用TLS证书SAN提取<例如:true/false>(默认:true)")
 		fmt.Println("-fpc                                是否启用基准指纹缓存快速比对<例如:true/false>(默认:true)")
 		fmt.Println("-as                                 是否启用自适应分阶段采样<例如:true/false>(默认:true)")
+		fmt.Println("-catchall                           是否启用万能响应IP检测<例如:true/false>(默认:true)")
+		fmt.Println("-cat                                万能响应IP判定阈值(默认:10)")
 	}
 
 	flag.Parse()

@@ -126,7 +126,7 @@ type Options struct {
 	// 对每个 IP 碰撞前 N 个 Host 后，如果响应全部相同则跳过该 IP 剩余 Host
 	EnableResponseElimination *bool
 
-	// ResponseSampleSize 响应快速排除的采样 Host 数量（默认500）
+	// ResponseSampleSize 响应快速排除的采样 Host 数量（默认50）
 	// 仅当 Host 总量大于此值时才启用采样排除
 	ResponseSampleSize int
 
@@ -157,6 +157,15 @@ type Options struct {
 	// EnableAdaptiveSampling 是否启用自适应分阶段采样（默认开启）
 	// 分阶段逐步增加采样数量，对明显无效的 IP 更快跳过
 	EnableAdaptiveSampling *bool
+
+	// EnableCatchAllDetection 是否启用万能响应IP检测（默认开启）
+	// 当一个 IP 对大量不同 Host 都碰撞成功时，判定为"万能响应"IP（默认虚拟主机/通配符配置），
+	// 自动清除该 IP 的所有碰撞结果并跳过剩余 Host
+	EnableCatchAllDetection *bool
+
+	// CatchAllThreshold 万能响应IP判定阈值（默认10）
+	// 当一个 IP+协议 维度碰撞成功的 Host 数量超过此值时，判定为万能响应IP
+	CatchAllThreshold int
 
 	// OnDNSFilterDone DNS 筛选完成时的回调函数（可选）
 	OnDNSFilterDone func(result *DNSFilterResult)
@@ -227,6 +236,7 @@ type Result struct {
 	BaseStatusCode         int    // 基准请求的状态码
 	ErrorHostStatusCode    int    // 绝对错误请求的状态码
 	RelativeHostStatusCode int    // 相对错误请求的状态码
+	BodySimhash            uint64 // 响应体 SimHash 指纹（64位），用于相似内容聚合
 }
 
 // String 返回结果的可读字符串
@@ -284,7 +294,7 @@ func DefaultOptions() *Options {
 		DNSMatchMode:              "24",
 		DNSConcurrency:            100,
 		EnableResponseElimination: boolPtr(true),
-		ResponseSampleSize:        500,
+		ResponseSampleSize:        50,
 		FullScan:                  false,
 		AutoFullScanThreshold:     720000,
 		// 方案一: HEAD 预筛选（默认开启）
@@ -296,6 +306,9 @@ func DefaultOptions() *Options {
 		EnableFingerprintCache: boolPtr(true),
 		// 方案五: 自适应分阶段采样（默认开启）
 		EnableAdaptiveSampling: boolPtr(true),
+		// 方案六: 万能响应IP检测（默认开启，阈值10）
+		EnableCatchAllDetection: boolPtr(true),
+		CatchAllThreshold:       10,
 	}
 }
 
@@ -584,6 +597,10 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 	// 如果需要实时回调，建议使用 RunWithCallback
 	var results []*Result
 	for _, r := range internalResults {
+		// 跳过被标记为无效的结果（万能响应IP检测）
+		if r.Invalid {
+			continue
+		}
 		result := internalResultToResult(r)
 		results = append(results, result)
 		if opts.OnResult != nil {
@@ -703,8 +720,11 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 			// 处理剩余结果
 			resultsMu.Lock()
 			for i := callbackIndex; i < len(internalResults); i++ {
-				if opts.OnResult != nil {
-					opts.OnResult(internalResultToResult(internalResults[i]))
+				// 跳过被标记为无效的结果（万能响应IP检测）
+				if !internalResults[i].Invalid {
+					if opts.OnResult != nil {
+						opts.OnResult(internalResultToResult(internalResults[i]))
+					}
 				}
 			}
 			resultsMu.Unlock()
@@ -721,6 +741,10 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 			resultsMu.Lock()
 			for i := callbackIndex; i < len(internalResults); i++ {
 				callbackIndex++
+				// 跳过被标记为无效的结果（万能响应IP检测）
+				if internalResults[i].Invalid {
+					continue
+				}
 				if opts.OnResult != nil {
 					opts.OnResult(internalResultToResult(internalResults[i]))
 				}
@@ -910,6 +934,13 @@ func optionsToConfig(opts *Options) *config.Config {
 	if opts.EnableAdaptiveSampling != nil {
 		cfg.Optimization.EnableAdaptiveSampling = *opts.EnableAdaptiveSampling
 	}
+	// 方案六: 万能响应IP检测
+	if opts.EnableCatchAllDetection != nil {
+		cfg.Optimization.EnableCatchAllDetection = *opts.EnableCatchAllDetection
+	}
+	if opts.CatchAllThreshold > 0 {
+		cfg.Optimization.CatchAllThreshold = opts.CatchAllThreshold
+	}
 
 	return cfg
 }
@@ -929,5 +960,6 @@ func internalResultToResult(r *collision.CollisionResult) *Result {
 		BaseStatusCode:         r.BaseStatusCode,
 		ErrorHostStatusCode:    r.ErrorHostStatusCode,
 		RelativeHostStatusCode: r.RelativeHostStatusCode,
+		BodySimhash:            r.BodySimhash,
 	}
 }

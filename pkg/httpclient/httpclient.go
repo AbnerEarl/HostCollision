@@ -1,10 +1,12 @@
 package httpclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -18,6 +20,51 @@ import (
 	"github.com/AbnerEarl/HostCollision/pkg/diffpage"
 	"github.com/AbnerEarl/HostCollision/pkg/helpers"
 )
+
+// ========== 抑制 Go 标准库无关日志 ==========
+
+// filterWriter 过滤特定日志的 io.Writer
+// Go 标准库 net/http 的 Transport 在空闲连接上收到未请求的响应时，
+// 会通过 log.Printf 输出 "Unsolicited response received on idle HTTP channel" 日志，
+// 这类日志不是错误，但会污染标准输出，影响日志可读性。
+type filterWriter struct {
+	original io.Writer
+	filters  [][]byte // 需要过滤的日志关键词
+}
+
+// Write 实现 io.Writer 接口，过滤包含特定关键词的日志
+func (fw *filterWriter) Write(p []byte) (n int, err error) {
+	for _, filter := range fw.filters {
+		if bytes.Contains(p, filter) {
+			// 返回成功写入的字节数（欺骗 log 包认为写入成功），但实际丢弃
+			return len(p), nil
+		}
+	}
+	return fw.original.Write(p)
+}
+
+// suppressLogOnce 确保日志过滤只初始化一次
+var suppressLogOnce sync.Once
+
+// SuppressUnsolicitedResponseLog 抑制 Go 标准库 net/http 输出的无关日志
+// 主要过滤 "Unsolicited response received on idle HTTP channel" 日志
+// 该日志在使用 HTTP Keep-Alive 连接池时，服务端主动关闭连接或推送异常响应时触发
+// 这不是程序错误，只是 Go 标准库的一个信息性输出
+func SuppressUnsolicitedResponseLog() {
+	suppressLogOnce.Do(func() {
+		log.SetOutput(&filterWriter{
+			original: log.Writer(),
+			filters: [][]byte{
+				[]byte("Unsolicited response received on idle HTTP channel"),
+			},
+		})
+	})
+}
+
+func init() {
+	// 自动抑制 Go 标准库 net/http 的无关日志
+	SuppressUnsolicitedResponseLog()
+}
 
 // ========== 常量定义 ==========
 
@@ -401,9 +448,17 @@ type HttpCustomRequest struct {
 }
 
 // Title 获取网页标题（带缓存）
+// 优先从原始 Body 中提取 title，如果提取不到再从 AppBody() 中提取
+// 修复: 当响应包含 Location 跳转头（301/302）时，AppBody() 返回的是 URL 字符串而非 HTML，
+// 导致正则匹配不到 <title> 标签，Title 为空
 func (r *HttpCustomRequest) Title() string {
 	if !r.titleComputed {
-		r.cachedTitle = helpers.GetBodyTitle(r.AppBody())
+		// 优先从原始响应体提取 title（即使是重定向响应，Body 中也可能包含 HTML）
+		r.cachedTitle = helpers.GetBodyTitle(r.Body)
+		// 如果原始 Body 中没有 title，再尝试从 AppBody() 中提取
+		if r.cachedTitle == "" {
+			r.cachedTitle = helpers.GetBodyTitle(r.AppBody())
+		}
 		r.titleComputed = true
 	}
 	return r.cachedTitle

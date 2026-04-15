@@ -169,6 +169,8 @@ type CollisionResult struct {
 	BaseStatusCode         int    // 原始的状态码
 	ErrorHostStatusCode    int    // 绝对错误的状态码
 	RelativeHostStatusCode int    // 相对错误的状态码
+	BodySimhash            uint64 // 响应体 SimHash 指纹（64位），用于相似内容聚合
+	Invalid                bool   // 是否已标记为无效（万能响应IP检测后标记）
 }
 
 // CSVHeaders CSV 表头
@@ -177,6 +179,7 @@ func CSVHeaders() []string {
 		"协议", "ip", "host", "标题",
 		"匹配成功的数据包大小", "原始的数据包大小", "绝对错误的数据包大小", "相对错误的数据包大小",
 		"匹配成功的数据包状态码", "原始的数据包状态码", "绝对错误的数据包状态码", "相对错误的数据包状态码",
+		"body_simhash",
 	}
 }
 
@@ -192,19 +195,20 @@ func (r *CollisionResult) ToCSVRecord() []string {
 		fmt.Sprintf("%d", r.BaseStatusCode),
 		fmt.Sprintf("%d", r.ErrorHostStatusCode),
 		fmt.Sprintf("%d", r.RelativeHostStatusCode),
+		fmt.Sprintf("%d", r.BodySimhash),
 	}
 }
 
 // ToTXTRecord 转换为 TXT 记录
 func (r *CollisionResult) ToTXTRecord() string {
-	return fmt.Sprintf("协议:%s, ip:%s, host:%s, title:%s, 匹配成功的数据包大小:%d, 状态码:%d 匹配成功",
-		r.Protocol, r.IP, r.Host, r.Title, r.MatchContentLen, r.MatchStatusCode)
+	return fmt.Sprintf("协议:%s, ip:%s, host:%s, title:%s, 匹配成功的数据包大小:%d, 状态码:%d, body_simhash:%d 匹配成功",
+		r.Protocol, r.IP, r.Host, r.Title, r.MatchContentLen, r.MatchStatusCode, r.BodySimhash)
 }
 
 // SuccessLog 匹配成功日志
 func (r *CollisionResult) SuccessLog() string {
-	return fmt.Sprintf("协议:%s, ip:%s, host:%s, title:%s, 匹配成功的数据包大小:%d, 状态码:%d 匹配成功",
-		r.Protocol, r.IP, r.Host, r.Title, r.MatchContentLen, r.MatchStatusCode)
+	return fmt.Sprintf("协议:%s, ip:%s, host:%s, title:%s, 匹配成功的数据包大小:%d, 状态码:%d, body_simhash:%d 匹配成功",
+		r.Protocol, r.IP, r.Host, r.Title, r.MatchContentLen, r.MatchStatusCode, r.BodySimhash)
 }
 
 // ========== 全局任务队列模型 ==========
@@ -599,10 +603,20 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 		})
 	}
 
+	// ===== 方案六: 万能响应IP检测 =====
+	// 实时统计碰撞成功数量，超过阈值时判定为"万能响应"IP
+	catchAllEnabled := w.cfg.Optimization.EnableCatchAllDetection
+	catchAllThreshold := w.cfg.Optimization.CatchAllThreshold
+	if catchAllThreshold <= 0 {
+		catchAllThreshold = 10 // 默认阈值
+	}
+	var ipSuccessCount int // 当前 IP+协议 的碰撞成功计数
+	var isCatchAll bool    // 是否已判定为万能响应IP
+
 	// 重试队列
 	var retryQueue []string
 
-	for _, host := range shuffledHosts {
+	for idx, host := range shuffledHosts {
 		atomic.AddInt64(w.numOfRequest, 1)
 
 		// 检查是否需要等待退避
@@ -614,6 +628,30 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 		if result == collisionResultWAFBlocked {
 			retryQueue = append(retryQueue, host)
 		}
+
+		// 万能响应IP检测：统计碰撞成功数量
+		if catchAllEnabled && result == collisionResultSuccess {
+			ipSuccessCount++
+
+			if ipSuccessCount >= catchAllThreshold {
+				isCatchAll = true
+				// 回溯清除该 IP 的所有碰撞结果
+				removed := w.removeCatchAllResults(protocol, ip)
+				// 跳过剩余 Host（idx+1 是已遍历的数量，已通过循环内 atomic.Add 计数）
+				remainingCount := len(shuffledHosts) - (idx + 1)
+				if remainingCount > 0 {
+					atomic.AddInt64(w.numOfRequest, int64(remainingCount))
+				}
+				fmt.Printf("[万能响应IP检测] 协议:%s, IP:%s 碰撞成功 %d 个Host(阈值%d), 判定为万能响应IP, 已清除 %d 条结果, 跳过剩余 %d 个Host\n",
+					protocol, ip, ipSuccessCount, catchAllThreshold, removed, remainingCount)
+				break
+			}
+		}
+	}
+
+	// 如果已判定为万能响应IP，跳过重试队列
+	if isCatchAll {
+		return
 	}
 
 	// 处理重试队列
@@ -644,7 +682,18 @@ func (w *Worker) processIPProtocol(protocol, ip string) {
 			extraDelay := 2000 + rand.Intn(3000)
 			time.Sleep(time.Duration(extraDelay) * time.Millisecond)
 
-			w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker, baseBodyHash, errorBodyHash)
+			retryResult := w.collision(wafKey, baseRequest, errorHostRequest, protocol, ip, host, tracker, baseBodyHash, errorBodyHash)
+
+			// 重试队列中也需要检测万能响应
+			if catchAllEnabled && retryResult == collisionResultSuccess {
+				ipSuccessCount++
+				if ipSuccessCount >= catchAllThreshold {
+					removed := w.removeCatchAllResults(protocol, ip)
+					fmt.Printf("[万能响应IP检测] 协议:%s, IP:%s 重试阶段碰撞成功 %d 个Host(阈值%d), 判定为万能响应IP, 已清除 %d 条结果\n",
+						protocol, ip, ipSuccessCount, catchAllThreshold, removed)
+					break
+				}
+			}
 		}
 	}
 }
@@ -1149,6 +1198,9 @@ func (w *Worker) collision(
 	}
 
 	// 碰撞成功！
+	// 计算响应体 SimHash 指纹，用于后续相似内容聚合
+	bodySimhash := simhash(newRequest.FilteredPageContent())
+
 	result := &CollisionResult{
 		Protocol:               protocol,
 		IP:                     ip,
@@ -1162,6 +1214,7 @@ func (w *Worker) collision(
 		BaseStatusCode:         baseRequest.StatusCode,
 		ErrorHostStatusCode:    errorHostRequest.StatusCode,
 		RelativeHostStatusCode: newRequest2.StatusCode,
+		BodySimhash:            bodySimhash,
 	}
 
 	// 保存碰撞成功的数据
@@ -1228,6 +1281,26 @@ func parseStatusCodes(statusCodeStr string) []string {
 		}
 	}
 	return result
+}
+
+// ========== 方案六: 万能响应IP检测 ==========
+
+// removeCatchAllResults 标记指定 IP+协议 的所有碰撞结果为无效
+// 当检测到某个 IP 为"万能响应"IP 时，将其所有已记录的碰撞结果标记为 Invalid
+// 使用标记式删除而非物理删除，避免与 RunWithCallback 的回调索引产生并发冲突
+// 返回被标记的结果数量
+func (w *Worker) removeCatchAllResults(protocol, ip string) int {
+	w.resultsMu.Lock()
+	defer w.resultsMu.Unlock()
+
+	marked := 0
+	for _, r := range *w.results {
+		if r.Protocol == protocol && r.IP == ip && !r.Invalid {
+			r.Invalid = true
+			marked++
+		}
+	}
+	return marked
 }
 
 // wafFeatureMatchingCached 使用缓存黑名单的 WAF 特征匹配
@@ -1312,6 +1385,158 @@ func (w *Worker) httpHeaderXPoweredByWafMatchingCached(baseReq, newReq *httpclie
 		}
 	}
 	return false
+}
+
+// ========== SimHash 局部敏感哈希 ==========
+
+// simhash 计算文本的 64 位 SimHash 指纹（局部敏感哈希）
+// SimHash 的核心特性：相似的文本产生相似的 hash 值，可通过海明距离判断相似度
+// 海明距离 ≤ 3 即认为内容高度相似，适合对碰撞结果进行聚合去重
+//
+// 算法流程:
+//  1. 将文本按空格/标点分词为 token 列表
+//  2. 对每个 token 计算 FNV-1a 64位 hash
+//  3. 构建 64 维加权向量：hash 的每一位为 1 则 +1，为 0 则 -1
+//  4. 向量每一维正数映射为 1，非正数映射为 0，组成 64 位指纹
+func simhash(text string) uint64 {
+	if text == "" {
+		return 0
+	}
+
+	// 分词：按非字母数字字符和中文字符边界切分
+	tokens := tokenize(text)
+	if len(tokens) == 0 {
+		return 0
+	}
+
+	// 64 维加权向量
+	var vector [64]int
+
+	for _, token := range tokens {
+		// 计算每个 token 的 FNV-1a hash
+		h := fnvHash(token)
+		if h == 0 {
+			continue
+		}
+
+		// 根据 hash 的每一位更新向量
+		for i := 0; i < 64; i++ {
+			if (h>>uint(i))&1 == 1 {
+				vector[i]++
+			} else {
+				vector[i]--
+			}
+		}
+	}
+
+	// 向量降维为 64 位指纹
+	var fingerprint uint64
+	for i := 0; i < 64; i++ {
+		if vector[i] > 0 {
+			fingerprint |= 1 << uint(i)
+		}
+	}
+
+	return fingerprint
+}
+
+// tokenize 将文本分词为 token 列表
+// 支持英文（按空格/标点分割）和中文（按字符切分，使用 bigram）
+func tokenize(text string) []string {
+	if len(text) == 0 {
+		return nil
+	}
+
+	runes := []rune(text)
+	var tokens []string
+	var current []rune
+
+	for _, r := range runes {
+		if isTokenChar(r) {
+			current = append(current, r)
+		} else {
+			if len(current) > 0 {
+				tokens = append(tokens, string(current))
+				current = current[:0]
+			}
+		}
+	}
+	if len(current) > 0 {
+		tokens = append(tokens, string(current))
+	}
+
+	// 对中文内容使用 bigram（二元组）增强指纹区分度
+	// 如果 token 包含中文字符且长度 >= 2，生成 bigram
+	var result []string
+	for _, token := range tokens {
+		tr := []rune(token)
+		if len(tr) >= 2 && hasCJK(tr) {
+			// 生成 bigram
+			for i := 0; i < len(tr)-1; i++ {
+				result = append(result, string(tr[i:i+2]))
+			}
+		} else {
+			result = append(result, token)
+		}
+	}
+
+	return result
+}
+
+// isTokenChar 判断字符是否为有效 token 字符（字母、数字、中文等）
+func isTokenChar(r rune) bool {
+	// ASCII 字母和数字
+	if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+		return true
+	}
+	// CJK 统一汉字（常用中文范围）
+	if r >= 0x4E00 && r <= 0x9FFF {
+		return true
+	}
+	// CJK 扩展 A
+	if r >= 0x3400 && r <= 0x4DBF {
+		return true
+	}
+	// 日文平假名和片假名
+	if r >= 0x3040 && r <= 0x30FF {
+		return true
+	}
+	// 韩文音节
+	if r >= 0xAC00 && r <= 0xD7AF {
+		return true
+	}
+	return false
+}
+
+// hasCJK 检查 rune 切片中是否包含 CJK 字符
+func hasCJK(runes []rune) bool {
+	for _, r := range runes {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return true
+		}
+		if r >= 0x3400 && r <= 0x4DBF {
+			return true
+		}
+		if r >= 0x3040 && r <= 0x30FF {
+			return true
+		}
+		if r >= 0xAC00 && r <= 0xD7AF {
+			return true
+		}
+	}
+	return false
+}
+
+// SimhashDistance 计算两个 SimHash 指纹的海明距离
+// 海明距离 ≤ 3 表示内容高度相似
+func SimhashDistance(a, b uint64) int {
+	xor := a ^ b
+	dist := 0
+	for xor != 0 {
+		dist++
+		xor &= xor - 1 // Brian Kernighan 算法，每次消除最低位的 1
+	}
+	return dist
 }
 
 // ========== 方案三: FNV hash 指纹计算 ==========

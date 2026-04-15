@@ -35,7 +35,7 @@ type OptimizationConfig struct {
 	DNSConcurrency int `yaml:"dnsConcurrency"`
 	// EnableResponseElimination 是否启用响应快速排除（默认开启）
 	EnableResponseElimination bool `yaml:"enableResponseElimination"`
-	// ResponseSampleSize 响应快速排除的采样 Host 数量（默认500）
+	// ResponseSampleSize 响应快速排除的采样 Host 数量（默认50）
 	ResponseSampleSize int `yaml:"responseSampleSize"`
 	// FullScan 是否强制全量扫描（忽略所有优化策略）
 	FullScan bool `yaml:"fullScan"`
@@ -65,6 +65,15 @@ type OptimizationConfig struct {
 	// EnableAdaptiveSampling 是否启用自适应分阶段采样（默认开启）
 	// 先采样少量 Host，逐步增加采样数量，对明显无效的 IP 更快跳过
 	EnableAdaptiveSampling bool `yaml:"enableAdaptiveSampling"`
+
+	// ===== 方案六: 万能响应IP检测 =====
+	// EnableCatchAllDetection 是否启用万能响应IP检测（默认开启）
+	// 当一个 IP 对大量不同 Host 都碰撞成功时，判定为"万能响应"IP（默认虚拟主机/通配符配置），
+	// 自动清除该 IP 的所有碰撞结果并跳过剩余 Host
+	EnableCatchAllDetection bool `yaml:"enableCatchAllDetection"`
+	// CatchAllThreshold 万能响应IP判定阈值（默认10）
+	// 当一个 IP+协议 维度碰撞成功的 Host 数量超过此值时，判定为万能响应IP
+	CatchAllThreshold int `yaml:"catchAllThreshold"`
 }
 
 // HTTPConfig HTTP 请求相关配置
@@ -255,7 +264,7 @@ func DefaultConfig() *Config {
 			DNSMatchMode:              "16",
 			DNSConcurrency:            100,
 			EnableResponseElimination: true,
-			ResponseSampleSize:        500,
+			ResponseSampleSize:        50,
 			FullScan:                  false,
 			// 默认阈值: 按200QPS计算，1小时可完成 200*3600=720000 次请求
 			AutoFullScanThreshold: 720000,
@@ -268,6 +277,9 @@ func DefaultConfig() *Config {
 			EnableFingerprintCache: true,
 			// 方案五: 自适应分阶段采样（默认开启）
 			EnableAdaptiveSampling: true,
+			// 方案六: 万能响应IP检测（默认开启）
+			EnableCatchAllDetection: true,
+			CatchAllThreshold:       10,
 		},
 	}
 }

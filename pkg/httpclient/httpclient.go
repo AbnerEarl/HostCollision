@@ -16,6 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/html/charset"
+	"golang.org/x/text/transform"
+
 	"github.com/AbnerEarl/HostCollision/pkg/config"
 	"github.com/AbnerEarl/HostCollision/pkg/diffpage"
 	"github.com/AbnerEarl/HostCollision/pkg/helpers"
@@ -426,6 +429,110 @@ func ApplyDelay(cfg *config.Config) {
 	time.Sleep(time.Duration(delay) * time.Millisecond)
 }
 
+// ========== 编码检测与转换 ==========
+
+// detectAndConvertToUTF8 检测响应体编码并转换为 UTF-8
+// 检测优先级: Content-Type header > HTML meta charset > 自动检测
+// 如果已经是 UTF-8 或检测/转换失败，返回原始内容
+func detectAndConvertToUTF8(body []byte, contentType string) string {
+	// 如果内容为空，直接返回
+	if len(body) == 0 {
+		return ""
+	}
+
+	// 尝试从 Content-Type header 和 HTML meta 标签中确定编码
+	// charset.DetermineEncoding 会综合考虑 Content-Type 和 HTML 内容
+	encoding, _, certain := charset.DetermineEncoding(body, contentType)
+
+	// 如果无法确定编码，或者确定是 UTF-8，直接返回原始字符串
+	if encoding == nil {
+		return string(body)
+	}
+
+	// 如果不确定编码，但内容看起来是合法的 UTF-8，直接返回
+	if !certain {
+		if isValidUTF8(body) {
+			return string(body)
+		}
+	}
+
+	// 尝试将内容转换为 UTF-8
+	reader := transform.NewReader(bytes.NewReader(body), encoding.NewDecoder())
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		// 转换失败，返回原始内容
+		return string(body)
+	}
+
+	return string(decoded)
+}
+
+// isValidUTF8 检查字节序列是否为合法的 UTF-8 编码
+// 通过检测是否包含典型的非 UTF-8 乱码特征来判断
+func isValidUTF8(data []byte) bool {
+	// 统计无效 UTF-8 字节的比例
+	invalidCount := 0
+	i := 0
+	for i < len(data) {
+		if data[i] < 0x80 {
+			// ASCII 字符
+			i++
+			continue
+		}
+
+		// 检查多字节 UTF-8 序列
+		var seqLen int
+		switch {
+		case data[i]&0xE0 == 0xC0:
+			seqLen = 2
+		case data[i]&0xF0 == 0xE0:
+			seqLen = 3
+		case data[i]&0xF8 == 0xF0:
+			seqLen = 4
+		default:
+			invalidCount++
+			i++
+			continue
+		}
+
+		if i+seqLen > len(data) {
+			invalidCount++
+			i++
+			continue
+		}
+
+		valid := true
+		for j := 1; j < seqLen; j++ {
+			if data[i+j]&0xC0 != 0x80 {
+				valid = false
+				break
+			}
+		}
+
+		if valid {
+			i += seqLen
+		} else {
+			invalidCount++
+			i++
+		}
+	}
+
+	// 如果无效字节超过非 ASCII 字节的 10%，认为不是 UTF-8
+	if invalidCount > 0 {
+		nonASCII := 0
+		for _, b := range data {
+			if b >= 0x80 {
+				nonASCII++
+			}
+		}
+		if nonASCII > 0 && float64(invalidCount)/float64(nonASCII) > 0.1 {
+			return false
+		}
+	}
+
+	return true
+}
+
 // ========== HTTP 请求响应封装 ==========
 
 // HttpCustomRequest 自定义HTTP请求响应封装
@@ -698,9 +805,13 @@ func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 		contentLength = int64(len(body))
 	}
 
+	// 编码检测与转换：将非 UTF-8 编码（如 GBK/GB2312）的响应体转换为 UTF-8
+	contentTypeHeader := resp.Header.Get("Content-Type")
+	bodyStr := detectAndConvertToUTF8(body, contentTypeHeader)
+
 	return &HttpCustomRequest{
 		Host:          requestHost,
-		Body:          string(body),
+		Body:          bodyStr,
 		StatusCode:    resp.StatusCode,
 		ContentLen:    int(contentLength),
 		Location:      resp.Header.Get("Location"),

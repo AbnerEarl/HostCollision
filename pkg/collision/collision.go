@@ -365,6 +365,7 @@ type Worker struct {
 	numOfRequest   *int64 // 原子计数器：请求数
 	results        *[]*CollisionResult
 	resultsMu      *sync.Mutex
+	resultDedup    map[string]struct{} // 全局结果去重集合（Protocol+IP+Host 构成唯一键，由 resultsMu 保护）
 	scanProtocols  []string
 	ipList         []string
 	hostList       []string
@@ -379,11 +380,13 @@ type Worker struct {
 }
 
 // NewWorker 创建新的碰撞工作器
+// resultDedup 为全局共享的去重集合，由 resultsMu 保护，所有 Worker 共享同一个实例
 func NewWorker(
 	cfg *config.Config,
 	numOfRequest *int64,
 	results *[]*CollisionResult,
 	resultsMu *sync.Mutex,
+	resultDedup map[string]struct{},
 	scanProtocols []string,
 	ipList []string,
 	hostList []string,
@@ -394,6 +397,7 @@ func NewWorker(
 		numOfRequest:   numOfRequest,
 		results:        results,
 		resultsMu:      resultsMu,
+		resultDedup:    resultDedup,
 		scanProtocols:  scanProtocols,
 		ipList:         ipList,
 		hostList:       hostList,
@@ -1217,8 +1221,17 @@ func (w *Worker) collision(
 		BodySimhash:            bodySimhash,
 	}
 
-	// 保存碰撞成功的数据
+	// 去重检查：Protocol+IP+Host 构成唯一键，避免重复结果
+	dedupKey := protocol + "|" + ip + "|" + host
 	w.resultsMu.Lock()
+	if _, exists := w.resultDedup[dedupKey]; exists {
+		w.resultsMu.Unlock()
+		if w.outputErrorLog {
+			fmt.Printf("协议:%s, ip:%s, host:%s 碰撞成功但已存在相同结果,跳过\n", protocol, ip, host)
+		}
+		return collisionResultFailed
+	}
+	w.resultDedup[dedupKey] = struct{}{}
 	*w.results = append(*w.results, result)
 	w.resultsMu.Unlock()
 

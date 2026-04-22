@@ -531,6 +531,7 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 	// 碰撞成功结果列表（内部类型）
 	var internalResults []*collision.CollisionResult
 	var resultsMu sync.Mutex
+	resultDedup := make(map[string]struct{}) // 全局去重集合
 
 	// 总任务数
 	requestTotal := int64(len(ipList) * len(opts.Protocols) * len(hostList))
@@ -547,6 +548,7 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 			&numOfRequest,
 			&internalResults,
 			&resultsMu,
+			resultDedup,
 			opts.Protocols,
 			nil, // 不再分配IP列表，从队列消费
 			hostList,
@@ -677,6 +679,7 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 	// 使用带回调的包装结果列表
 	var internalResults []*collision.CollisionResult
 	var resultsMu sync.Mutex
+	resultDedup := make(map[string]struct{}) // 全局去重集合
 
 	requestTotal := int64(len(ipList) * len(opts.Protocols) * len(hostList))
 
@@ -691,6 +694,7 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 			&numOfRequest,
 			&internalResults,
 			&resultsMu,
+			resultDedup,
 			opts.Protocols,
 			nil,
 			hostList,

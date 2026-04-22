@@ -203,6 +203,7 @@ func main() {
 	// 碰撞成功结果列表
 	var results []*collision.CollisionResult
 	var resultsMu sync.Mutex
+	resultDedup := make(map[string]struct{}) // 全局去重集合
 
 	// IP 预检测：快速过滤不可达的IP，避免后续大量无效请求
 	fmt.Println("=======================IP 预 检 测=======================")
@@ -333,6 +334,7 @@ func main() {
 			&numOfRequest,
 			&results,
 			&resultsMu,
+			resultDedup,
 			scanProtocols,
 			nil, // 不再分配IP列表，从队列消费
 			hostList,
@@ -378,6 +380,10 @@ func main() {
 				resultsMu.Lock()
 				for i := csvIndex; i < len(results); i++ {
 					csvIndex++
+					// 跳过被标记为无效的结果（万能响应IP检测）
+					if results[i].Invalid {
+						continue
+					}
 					if err := csvWriter.Write(results[i].ToCSVRecord()); err != nil {
 						fmt.Printf("\nerror: csv文件写入内容出错: %v\n", err)
 						resultsMu.Unlock()
@@ -393,6 +399,10 @@ func main() {
 				resultsMu.Lock()
 				for i := txtIndex; i < len(results); i++ {
 					txtIndex++
+					// 跳过被标记为无效的结果（万能响应IP检测）
+					if results[i].Invalid {
+						continue
+					}
 					data := results[i].ToTXTRecord() + "\r\n"
 					if _, err := txtFile.WriteString(data); err != nil {
 						fmt.Printf("\nerror: txt文件写入内容出错: %v\n", err)
@@ -408,7 +418,9 @@ func main() {
 			if isOutputCSV && csvWriter != nil {
 				resultsMu.Lock()
 				for i := csvIndex; i < len(results); i++ {
-					csvWriter.Write(results[i].ToCSVRecord())
+					if !results[i].Invalid {
+						csvWriter.Write(results[i].ToCSVRecord())
+					}
 				}
 				csvWriter.Flush()
 				csvFile.Close()
@@ -417,20 +429,25 @@ func main() {
 			if isOutputTXT && txtFile != nil {
 				resultsMu.Lock()
 				for i := txtIndex; i < len(results); i++ {
-					txtFile.WriteString(results[i].ToTXTRecord() + "\r\n")
+					if !results[i].Invalid {
+						txtFile.WriteString(results[i].ToTXTRecord() + "\r\n")
+					}
 				}
 				txtFile.Close()
 				resultsMu.Unlock()
 			}
 
-			// 输出最终结果
+			// 输出最终结果（过滤万能响应IP的无效结果）
 			fmt.Print("\n\n\n\n\n")
 			fmt.Println("====================碰 撞 成 功 列 表====================")
-			if len(results) > 0 {
-				for _, r := range results {
+			validCount := 0
+			for _, r := range results {
+				if !r.Invalid {
 					fmt.Println(r.SuccessLog())
+					validCount++
 				}
-			} else {
+			}
+			if validCount == 0 {
 				fmt.Println("没有碰撞成功的数据")
 			}
 			fmt.Println("执行完毕 ヾ(≧▽≦*)o")

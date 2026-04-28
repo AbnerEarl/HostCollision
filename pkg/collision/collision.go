@@ -260,8 +260,8 @@ func PreCheckIPs(ipList []string, protocols []string, outputErrorLog bool) []str
 	reachableSet := make(map[string]bool)
 	var wg sync.WaitGroup
 
-	// 并发检测，但限制并发数避免瞬间大量连接
-	sem := make(chan struct{}, 20)
+	// 并发检测，限制并发数避免瞬间大量连接（提升到100以加速大量IP的预检测）
+	sem := make(chan struct{}, 100)
 
 	for _, ip := range ipList {
 		for _, protocol := range protocols {
@@ -366,6 +366,7 @@ type Worker struct {
 	results        *[]*CollisionResult
 	resultsMu      *sync.Mutex
 	resultDedup    map[string]struct{} // 全局结果去重集合（Protocol+IP+Host 构成唯一键，由 resultsMu 保护）
+	simhashDedup   map[string]uint64   // 基于 SimHash 的同IP去重集合（Protocol+IP → 首个SimHash，由 resultsMu 保护）
 	scanProtocols  []string
 	ipList         []string
 	hostList       []string
@@ -381,12 +382,14 @@ type Worker struct {
 
 // NewWorker 创建新的碰撞工作器
 // resultDedup 为全局共享的去重集合，由 resultsMu 保护，所有 Worker 共享同一个实例
+// simhashDedup 为全局共享的 SimHash 去重集合，由 resultsMu 保护
 func NewWorker(
 	cfg *config.Config,
 	numOfRequest *int64,
 	results *[]*CollisionResult,
 	resultsMu *sync.Mutex,
 	resultDedup map[string]struct{},
+	simhashDedup map[string]uint64,
 	scanProtocols []string,
 	ipList []string,
 	hostList []string,
@@ -398,6 +401,7 @@ func NewWorker(
 		results:        results,
 		resultsMu:      resultsMu,
 		resultDedup:    resultDedup,
+		simhashDedup:   simhashDedup,
 		scanProtocols:  scanProtocols,
 		ipList:         ipList,
 		hostList:       hostList,
@@ -1044,6 +1048,19 @@ func (w *Worker) collision(
 		return collisionResultFailed
 	}
 
+	// ===== 状态码+内容长度联合比对：碰撞结果与直接访问IP结果完全一致则丢弃 =====
+	if newRequest.StatusCode == baseRequest.StatusCode &&
+		newRequest.ContentLen == baseRequest.ContentLen &&
+		newRequest.ServerHeader == baseRequest.ServerHeader {
+		// 状态码、内容长度、Server头都相同，大概率是相同响应
+		if newRequest.AppBody() == baseRequest.AppBody() {
+			if w.outputErrorLog {
+				fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-2(响应与直接访问IP完全一致)\n", protocol, ip, host)
+			}
+			return collisionResultFailed
+		}
+	}
+
 	// 快速内容比对
 	newBody := newRequest.AppBody()
 	baseBody := baseRequest.AppBody()
@@ -1231,6 +1248,23 @@ func (w *Worker) collision(
 		}
 		return collisionResultFailed
 	}
+
+	// SimHash 去重：同一个 IP+协议 下，不同 Host 的响应内容高度相似（海明距离 ≤ 3）则只保留第一个
+	if w.simhashDedup != nil && bodySimhash != 0 {
+		simhashKey := protocol + "|" + ip
+		if existingHash, exists := w.simhashDedup[simhashKey]; exists {
+			if SimhashDistance(existingHash, bodySimhash) <= 3 {
+				w.resultsMu.Unlock()
+				if w.outputErrorLog {
+					fmt.Printf("协议:%s, ip:%s, host:%s 碰撞成功但SimHash与已有结果高度相似(距离≤3),跳过\n", protocol, ip, host)
+				}
+				return collisionResultFailed
+			}
+		} else {
+			w.simhashDedup[simhashKey] = bodySimhash
+		}
+	}
+
 	w.resultDedup[dedupKey] = struct{}{}
 	*w.results = append(*w.results, result)
 	w.resultsMu.Unlock()

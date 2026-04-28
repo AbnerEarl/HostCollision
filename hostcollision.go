@@ -532,6 +532,7 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 	var internalResults []*collision.CollisionResult
 	var resultsMu sync.Mutex
 	resultDedup := make(map[string]struct{}) // 全局去重集合
+	simhashDedup := make(map[string]uint64)  // SimHash 去重集合（同IP不同Host的相似内容聚合）
 
 	// 总任务数
 	requestTotal := int64(len(ipList) * len(opts.Protocols) * len(hostList))
@@ -549,6 +550,7 @@ func RunWithOptions(ipList, hostList []string, opts *Options) ([]*Result, error)
 			&internalResults,
 			&resultsMu,
 			resultDedup,
+			simhashDedup,
 			opts.Protocols,
 			nil, // 不再分配IP列表，从队列消费
 			hostList,
@@ -680,6 +682,7 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 	var internalResults []*collision.CollisionResult
 	var resultsMu sync.Mutex
 	resultDedup := make(map[string]struct{}) // 全局去重集合
+	simhashDedup := make(map[string]uint64)  // SimHash 去重集合
 
 	requestTotal := int64(len(ipList) * len(opts.Protocols) * len(hostList))
 
@@ -695,6 +698,7 @@ func RunWithCallback(ipList, hostList []string, opts *Options) error {
 			&internalResults,
 			&resultsMu,
 			resultDedup,
+			simhashDedup,
 			opts.Protocols,
 			nil,
 			hostList,

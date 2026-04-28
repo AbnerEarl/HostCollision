@@ -179,6 +179,8 @@ func main() {
 			fmt.Printf("\nerror: txt文件创建失败: %v\n", err)
 			os.Exit(0)
 		}
+		// 写入 BOM（支持编辑器中文显示）
+		txtFile.Write([]byte{0xEF, 0xBB, 0xBF})
 	}
 
 	// 优雅退出处理
@@ -204,6 +206,7 @@ func main() {
 	var results []*collision.CollisionResult
 	var resultsMu sync.Mutex
 	resultDedup := make(map[string]struct{}) // 全局去重集合
+	simhashDedup := make(map[string]uint64)  // SimHash 去重集合（同IP不同Host的相似内容聚合）
 
 	// IP 预检测：快速过滤不可达的IP，避免后续大量无效请求
 	fmt.Println("=======================IP 预 检 测=======================")
@@ -335,6 +338,7 @@ func main() {
 			&results,
 			&resultsMu,
 			resultDedup,
+			simhashDedup,
 			scanProtocols,
 			nil, // 不再分配IP列表，从队列消费
 			hostList,

@@ -228,6 +228,7 @@ type Result struct {
 	IP                     string // IP 地址
 	Host                   string // 碰撞成功的 Host
 	Title                  string // 网页标题
+	Body                   string // 响应体内容
 	MatchContentLen        int    // 碰撞请求的响应大小
 	BaseContentLen         int    // 基准请求的响应大小
 	ErrorHostContentLen    int    // 绝对错误请求的响应大小
@@ -960,6 +961,7 @@ func internalResultToResult(r *collision.CollisionResult) *Result {
 		IP:                     r.IP,
 		Host:                   r.Host,
 		Title:                  r.Title,
+		Body:                   r.Body,
 		MatchContentLen:        r.MatchContentLen,
 		BaseContentLen:         r.BaseContentLen,
 		ErrorHostContentLen:    r.ErrorHostContentLen,

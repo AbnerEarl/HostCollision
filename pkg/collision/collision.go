@@ -161,6 +161,7 @@ type CollisionResult struct {
 	IP                     string // IP地址
 	Host                   string // Host
 	Title                  string // 网页标题
+	Body                   string // 响应体内容
 	MatchContentLen        int    // 匹配成功的数据包大小
 	BaseContentLen         int    // 原始的数据包大小
 	ErrorHostContentLen    int    // 绝对错误的数据包大小
@@ -1218,6 +1219,35 @@ func (w *Worker) collision(
 		}
 	}
 
+	// ===== 直接请求 Host 比对：如果碰撞结果与直接访问 Host 的结果一致，则不算隐形资产 =====
+	// 通过正常 DNS 解析直接请求 Host，如果响应与碰撞结果一致，说明该 Host 本身就解析到了这个 IP，
+	// 或者响应内容完全相同，不属于隐形资产发现
+	hostDirectReq, hostDirectErr := httpclient.SendHTTPGetRequest(protocol, host, host)
+	if hostDirectErr == nil && hostDirectReq != nil {
+		// 比对状态码、内容长度和响应体
+		if hostDirectReq.StatusCode == newRequest.StatusCode &&
+			hostDirectReq.ContentLen == newRequest.ContentLen {
+			// 状态码和内容长度一致，进一步比对 Body
+			if hostDirectReq.AppBody() == newRequest.AppBody() {
+				if w.outputErrorLog {
+					fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果完全一致,非隐形资产)\n", protocol, ip, host)
+				}
+				return collisionResultFailed
+			}
+		}
+		// 即使 Body 不完全一致，也检查 Title 是否相同
+		if hostDirectReq.Title() != "" && hostDirectReq.Title() == newRequest.Title() {
+			// Title 相同，再检查相似度
+			_, exceeded := diffpage.GetRatioWithThreshold(hostDirectReq.BodyFormat(), newRequest.BodyFormat(), w.cfg.SimilarityRatio)
+			if exceeded {
+				if w.outputErrorLog {
+					fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host高度相似,非隐形资产)\n", protocol, ip, host)
+				}
+				return collisionResultFailed
+			}
+		}
+	}
+
 	// 碰撞成功！
 	// 计算响应体 SimHash 指纹，用于后续相似内容聚合
 	bodySimhash := simhash(newRequest.FilteredPageContent())
@@ -1227,6 +1257,7 @@ func (w *Worker) collision(
 		IP:                     ip,
 		Host:                   host,
 		Title:                  newRequest.Title(),
+		Body:                   newRequest.Body,
 		MatchContentLen:        newRequest.ContentLen,
 		BaseContentLen:         baseRequest.ContentLen,
 		ErrorHostContentLen:    errorHostRequest.ContentLen,

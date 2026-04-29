@@ -434,6 +434,12 @@ func ApplyDelay(cfg *config.Config) {
 // detectAndConvertToUTF8 检测响应体编码并转换为 UTF-8
 // 检测优先级: Content-Type header > HTML meta charset > 自动检测
 // 如果已经是 UTF-8 或检测/转换失败，返回原始内容
+//
+// 关键修复：某些 GBK/GB2312 编码的字节序列恰好也是合法的 UTF-8 多字节序列，
+// 导致 isValidUTF8 误判为 UTF-8 而跳过转换。修复策略：
+// 1. 当 charset.DetermineEncoding 检测到非 UTF-8 编码时，无论 certain 值如何，都尝试转换
+// 2. 转换后验证结果是否比原始内容更合理（包含更多有效中文字符）
+// 3. 只有在完全无法确定编码且内容是合法 UTF-8 时才跳过转换
 func detectAndConvertToUTF8(body []byte, contentType string) string {
 	// 如果内容为空，直接返回
 	if len(body) == 0 {
@@ -442,29 +448,88 @@ func detectAndConvertToUTF8(body []byte, contentType string) string {
 
 	// 尝试从 Content-Type header 和 HTML meta 标签中确定编码
 	// charset.DetermineEncoding 会综合考虑 Content-Type 和 HTML 内容
-	encoding, _, certain := charset.DetermineEncoding(body, contentType)
+	encoding, encodingName, certain := charset.DetermineEncoding(body, contentType)
 
-	// 如果无法确定编码，或者确定是 UTF-8，直接返回原始字符串
+	// 如果无法确定编码，直接返回原始字符串
 	if encoding == nil {
 		return string(body)
 	}
 
-	// 如果不确定编码，但内容看起来是合法的 UTF-8，直接返回
-	if !certain {
-		if isValidUTF8(body) {
-			return string(body)
-		}
+	// 判断检测到的编码是否为 UTF-8 系列
+	encodingNameLower := strings.ToLower(encodingName)
+	isUTF8Encoding := encodingNameLower == "utf-8" || encodingNameLower == "utf8"
+
+	// 如果确定是 UTF-8 编码，直接返回
+	if certain && isUTF8Encoding {
+		return string(body)
 	}
 
-	// 尝试将内容转换为 UTF-8
+	// 如果检测到非 UTF-8 编码（如 GBK/GB2312/GB18030/Shift_JIS 等），
+	// 无论 certain 值如何，都尝试转换。
+	// 这是因为 charset.DetermineEncoding 基于 Content-Type 和 HTML meta 标签的检测
+	// 通常比纯字节序列分析更可靠。
+	if !isUTF8Encoding {
+		reader := transform.NewReader(bytes.NewReader(body), encoding.NewDecoder())
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			// 转换失败，返回原始内容
+			return string(body)
+		}
+		// 转换后验证：如果转换结果包含更多有效 CJK 字符，说明转换是正确的
+		if countCJKChars(string(decoded)) >= countCJKChars(string(body)) {
+			return string(decoded)
+		}
+		// 转换后 CJK 字符反而减少了，可能是误判，返回原始内容
+		return string(body)
+	}
+
+	// 检测到 UTF-8 但不确定（certain=false），检查内容是否为合法 UTF-8
+	if isValidUTF8(body) {
+		return string(body)
+	}
+
+	// 内容不是合法 UTF-8，尝试转换
 	reader := transform.NewReader(bytes.NewReader(body), encoding.NewDecoder())
 	decoded, err := io.ReadAll(reader)
 	if err != nil {
-		// 转换失败，返回原始内容
 		return string(body)
 	}
 
 	return string(decoded)
+}
+
+// countCJKChars 统计字符串中 CJK（中日韩）字符的数量
+// 用于编码转换后的验证：正确的编码转换应该产生更多有效的 CJK 字符
+func countCJKChars(s string) int {
+	count := 0
+	for _, r := range s {
+		// CJK 统一汉字
+		if r >= 0x4E00 && r <= 0x9FFF {
+			count++
+			continue
+		}
+		// CJK 扩展 A
+		if r >= 0x3400 && r <= 0x4DBF {
+			count++
+			continue
+		}
+		// 日文平假名和片假名
+		if r >= 0x3040 && r <= 0x30FF {
+			count++
+			continue
+		}
+		// 韩文音节
+		if r >= 0xAC00 && r <= 0xD7AF {
+			count++
+			continue
+		}
+		// CJK 兼容汉字
+		if r >= 0xF900 && r <= 0xFAFF {
+			count++
+			continue
+		}
+	}
+	return count
 }
 
 // isValidUTF8 检查字节序列是否为合法的 UTF-8 编码

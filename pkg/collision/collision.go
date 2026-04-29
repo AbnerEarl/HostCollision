@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1219,31 +1220,51 @@ func (w *Worker) collision(
 		}
 	}
 
-	// ===== 直接请求 Host 比对：如果碰撞结果与直接访问 Host 的结果一致，则不算隐形资产 =====
-	// 通过正常 DNS 解析直接请求 Host，如果响应与碰撞结果一致，说明该 Host 本身就解析到了这个 IP，
-	// 或者响应内容完全相同，不属于隐形资产发现
-	hostDirectReq, hostDirectErr := httpclient.SendHTTPGetRequest(protocol, host, host)
-	if hostDirectErr == nil && hostDirectReq != nil {
-		// 比对状态码、内容长度和响应体
-		if hostDirectReq.StatusCode == newRequest.StatusCode &&
-			hostDirectReq.ContentLen == newRequest.ContentLen {
-			// 状态码和内容长度一致，进一步比对 Body
-			if hostDirectReq.AppBody() == newRequest.AppBody() {
+	// ===== 直接请求 Host 比对：如果 Host 的 DNS 解析到的 IP 就是碰撞目标 IP，则不算隐形资产 =====
+	// 核心逻辑：隐形资产的定义是 "DNS 没有指向该 IP，但该 IP 上确实部署了该 Host 的服务"
+	// 因此只有当 Host 的 DNS 解析到了碰撞目标 IP 时，才说明这不是隐形资产
+	// 如果 Host 的 DNS 解析到了不同的 IP，即使响应内容相似，也应该保留（这正是隐形资产）
+	hostIPs, dnsErr := net.LookupHost(host)
+	if dnsErr == nil && len(hostIPs) > 0 {
+		// 检查 Host 的 DNS 解析结果是否包含碰撞目标 IP
+		hostResolvesToTargetIP := false
+		for _, resolvedIP := range hostIPs {
+			if resolvedIP == ip {
+				hostResolvesToTargetIP = true
+				break
+			}
+		}
+		if hostResolvesToTargetIP {
+			// Host 的 DNS 直接解析到了碰撞目标 IP，这不是隐形资产
+			if w.outputErrorLog {
+				fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(Host的DNS直接解析到目标IP,非隐形资产)\n", protocol, ip, host)
+			}
+			return collisionResultFailed
+		}
+		// Host 的 DNS 解析到了不同的 IP，进一步比对响应内容
+		// 如果碰撞结果与直接请求 Host 的响应完全一致，说明可能是 CDN 分发的相同内容
+		hostDirectReq, hostDirectErr := httpclient.SendHTTPGetRequest(protocol, host, host)
+		if hostDirectErr == nil && hostDirectReq != nil {
+			// 条件1：状态码相同且内容完全一致 → 直接过滤
+			if hostDirectReq.StatusCode == newRequest.StatusCode &&
+				hostDirectReq.ContentLen == newRequest.ContentLen &&
+				hostDirectReq.AppBody() == newRequest.AppBody() {
 				if w.outputErrorLog {
 					fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果完全一致,非隐形资产)\n", protocol, ip, host)
 				}
 				return collisionResultFailed
 			}
-		}
-		// 即使 Body 不完全一致，也检查 Title 是否相同
-		if hostDirectReq.Title() != "" && hostDirectReq.Title() == newRequest.Title() {
-			// Title 相同，再检查相似度
-			_, exceeded := diffpage.GetRatioWithThreshold(hostDirectReq.BodyFormat(), newRequest.BodyFormat(), w.cfg.SimilarityRatio)
-			if exceeded {
-				if w.outputErrorLog {
-					fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host高度相似,非隐形资产)\n", protocol, ip, host)
+			// 条件2：状态码相同，Body 不完全一致（可能有动态内容如时间戳、token 等）
+			// 使用 SimHash 相似度比对，海明距离 ≤ 3 视为同一页面
+			if hostDirectReq.StatusCode == newRequest.StatusCode {
+				collisionSimhash := simhash(newRequest.FilteredPageContent())
+				directSimhash := simhash(hostDirectReq.FilteredPageContent())
+				if SimhashDistance(collisionSimhash, directSimhash) <= 3 {
+					if w.outputErrorLog {
+						fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果高度相似,SimHash海明距离≤3,非隐形资产)\n", protocol, ip, host)
+					}
+					return collisionResultFailed
 				}
-				return collisionResultFailed
 			}
 		}
 	}
@@ -1280,20 +1301,49 @@ func (w *Worker) collision(
 		return collisionResultFailed
 	}
 
-	// SimHash 去重：同一个 IP+协议 下，不同 Host 的响应内容高度相似（海明距离 ≤ 3）则只保留第一个
+	// SimHash 去重：
+	// 1. 同一个 IP+协议 下，不同 Host 的响应内容高度相似（海明距离 ≤ 3）则只保留第一个
+	// 2. 跨 IP 的全局去重：不同 IP 上的不同 Host 产生了相同的 SimHash，说明是同一个默认页面（如 CDN 默认页、404 页面等）
 	if w.simhashDedup != nil && bodySimhash != 0 {
-		simhashKey := protocol + "|" + ip
-		if existingHash, exists := w.simhashDedup[simhashKey]; exists {
+		// 策略一：同 IP 维度去重
+		simhashKeyLocal := protocol + "|" + ip
+		if existingHash, exists := w.simhashDedup[simhashKeyLocal]; exists {
 			if SimhashDistance(existingHash, bodySimhash) <= 3 {
 				w.resultsMu.Unlock()
 				if w.outputErrorLog {
-					fmt.Printf("协议:%s, ip:%s, host:%s 碰撞成功但SimHash与已有结果高度相似(距离≤3),跳过\n", protocol, ip, host)
+					fmt.Printf("协议:%s, ip:%s, host:%s 碰撞成功但SimHash与同IP已有结果高度相似(距离≤3),跳过\n", protocol, ip, host)
 				}
 				return collisionResultFailed
 			}
 		} else {
-			w.simhashDedup[simhashKey] = bodySimhash
+			w.simhashDedup[simhashKeyLocal] = bodySimhash
 		}
+
+		// 策略二：跨 IP 全局去重（不同 IP 上的相同默认页面）
+		// 使用 "global|" 前缀 + SimHash 值作为全局去重键
+		globalSimhashKey := fmt.Sprintf("global|%d", bodySimhash)
+		if _, exists := w.simhashDedup[globalSimhashKey]; exists {
+			w.resultsMu.Unlock()
+			if w.outputErrorLog {
+				fmt.Printf("协议:%s, ip:%s, host:%s 碰撞成功但SimHash与其他IP的已有结果完全相同,跳过\n", protocol, ip, host)
+			}
+			return collisionResultFailed
+		}
+		// 跨 IP 还需要检查海明距离（不仅仅是完全相同）
+		for existKey, existHash := range w.simhashDedup {
+			// 只检查其他 IP 的记录（跳过同 IP 和 global 前缀的记录）
+			if strings.HasPrefix(existKey, "global|") || existKey == simhashKeyLocal {
+				continue
+			}
+			if SimhashDistance(existHash, bodySimhash) <= 3 {
+				w.resultsMu.Unlock()
+				if w.outputErrorLog {
+					fmt.Printf("协议:%s, ip:%s, host:%s 碰撞成功但SimHash与其他IP(%s)的已有结果高度相似(距离≤3),跳过\n", protocol, ip, host, existKey)
+				}
+				return collisionResultFailed
+			}
+		}
+		w.simhashDedup[globalSimhashKey] = bodySimhash
 	}
 
 	w.resultDedup[dedupKey] = struct{}{}

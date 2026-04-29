@@ -15,8 +15,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/html/charset"
+	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 
 	"github.com/AbnerEarl/HostCollision/pkg/config"
@@ -472,30 +474,147 @@ func detectAndConvertToUTF8(body []byte, contentType string) string {
 		reader := transform.NewReader(bytes.NewReader(body), encoding.NewDecoder())
 		decoded, err := io.ReadAll(reader)
 		if err != nil {
-			// 转换失败，返回原始内容
+			// 转换失败，尝试 GBK 解码作为备选
+			gbkDecoded := tryGBKDecode(body)
+			if gbkDecoded != "" && countCJKChars(gbkDecoded) > 0 {
+				return gbkDecoded
+			}
 			return string(body)
 		}
-		// 转换后验证：如果转换结果包含更多有效 CJK 字符，说明转换是正确的
-		if countCJKChars(string(decoded)) >= countCJKChars(string(body)) {
-			return string(decoded)
+		decodedStr := string(decoded)
+		decodedCJK := countCJKChars(decodedStr)
+		originalCJK := countCJKChars(string(body))
+
+		// 如果检测到的编码解码后产生了有效 CJK 字符，且比原始内容多，说明解码正确
+		if decodedCJK > 0 && decodedCJK >= originalCJK {
+			return decodedStr
 		}
-		// 转换后 CJK 字符反而减少了，可能是误判，返回原始内容
-		return string(body)
+
+		// 检测到的编码解码后没有产生 CJK 字符（如 windows-1252 解码 GBK 内容）
+		// 额外尝试 GBK 解码，看是否能产生有效中文
+		if decodedCJK == 0 && originalCJK == 0 {
+			// 检查原始内容是否包含非 ASCII 字节（可能是 GBK 编码）
+			hasHighBytes := false
+			for _, b := range body {
+				if b >= 0x80 {
+					hasHighBytes = true
+					break
+				}
+			}
+			if hasHighBytes {
+				gbkDecoded := tryGBKDecode(body)
+				if gbkDecoded != "" && countCJKChars(gbkDecoded) > 0 {
+					return gbkDecoded
+				}
+			}
+		}
+
+		// 如果解码后 CJK 字符反而减少了，可能是误判，返回原始内容
+		if decodedCJK < originalCJK {
+			return string(body)
+		}
+
+		// 其他情况（如纯 ASCII 内容），返回解码结果
+		return decodedStr
 	}
 
-	// 检测到 UTF-8 但不确定（certain=false），检查内容是否为合法 UTF-8
+	// 检测到 UTF-8 但不确定（certain=false）
+	// 需要区分两种情况：
+	// A) 真正的 UTF-8 内容（meta 标签声明了 utf-8，或内容本身就是 UTF-8 中文）
+	// B) GBK 内容恰好通过了 UTF-8 合法性检查（极少数 GBK 字节序列恰好是合法 UTF-8）
 	if isValidUTF8(body) {
-		return string(body)
+		utf8Str := string(body)
+		utf8CJK := countCJKChars(utf8Str)
+
+		// 策略1：如果 HTML meta 标签明确声明了 charset=utf-8，直接信任
+		// charset.DetermineEncoding 已经检测到 utf-8（来自 meta 标签），直接返回
+		if hasUTF8MetaCharset(body) {
+			return utf8Str
+		}
+
+		// 策略2：如果原始 UTF-8 内容已经包含 CJK 字符，说明它确实是 UTF-8 编码的中文内容
+		// 不应该再尝试 GBK 解码，因为 GBK 解码 UTF-8 中文时会产生"膨胀"的假 CJK 字符
+		// （3字节 UTF-8 中文 → 被拆成 2 个 GBK 字符，部分恰好落在 CJK 范围）
+		if utf8CJK > 0 {
+			return utf8Str
+		}
+
+		// 策略3：原始内容没有 CJK 字符，但包含非 ASCII 字节
+		// 这种情况可能是 GBK 编码的内容恰好通过了 UTF-8 合法性检查
+		hasNonASCII := false
+		for _, b := range body {
+			if b >= 0x80 {
+				hasNonASCII = true
+				break
+			}
+		}
+		if hasNonASCII {
+			gbkDecoded := tryGBKDecode(body)
+			if gbkDecoded != "" {
+				gbkCJK := countCJKChars(gbkDecoded)
+				// 原始 UTF-8 没有 CJK 字符，但 GBK 解码后有 → 说明原始内容实际是 GBK 编码
+				if gbkCJK > 0 {
+					if utf8.ValidString(gbkDecoded) {
+						return gbkDecoded
+					}
+				}
+			}
+		}
+		return utf8Str
 	}
 
 	// 内容不是合法 UTF-8，尝试转换
 	reader := transform.NewReader(bytes.NewReader(body), encoding.NewDecoder())
 	decoded, err := io.ReadAll(reader)
 	if err != nil {
+		// 转换失败，再尝试 GBK
+		gbkDecoded := tryGBKDecode(body)
+		if gbkDecoded != "" {
+			return gbkDecoded
+		}
 		return string(body)
 	}
 
 	return string(decoded)
+}
+
+// hasUTF8MetaCharset 检查 HTML 内容中是否有 meta 标签明确声明了 UTF-8 编码
+// 支持两种常见格式：
+//   - <meta charset="utf-8">
+//   - <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+func hasUTF8MetaCharset(body []byte) bool {
+	// 只检查前 1024 字节（meta 标签通常在 head 的开头部分）
+	checkLen := 1024
+	if len(body) < checkLen {
+		checkLen = len(body)
+	}
+	head := strings.ToLower(string(body[:checkLen]))
+
+	// 检查 <meta charset="utf-8"> 或 <meta charset='utf-8'>
+	if strings.Contains(head, `charset="utf-8"`) || strings.Contains(head, `charset='utf-8'`) {
+		return true
+	}
+	// 检查 charset=utf-8（无引号，如在 Content-Type 中）
+	if strings.Contains(head, "charset=utf-8") {
+		return true
+	}
+	return false
+}
+
+// tryGBKDecode 尝试将字节序列按 GBK 编码解码为 UTF-8 字符串
+// 如果解码失败或结果无效，返回空字符串
+func tryGBKDecode(body []byte) string {
+	reader := transform.NewReader(bytes.NewReader(body), simplifiedchinese.GBK.NewDecoder())
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return ""
+	}
+	result := string(decoded)
+	// 验证解码结果是否为合法 UTF-8
+	if !utf8.ValidString(result) {
+		return ""
+	}
+	return result
 }
 
 // countCJKChars 统计字符串中 CJK（中日韩）字符的数量
@@ -759,6 +878,7 @@ func SendHTTPGetRequestQuick(protocol, ip, host string) (*HttpCustomRequest, err
 
 // SendHTTPGetRequest 发送HTTP GET请求
 // 支持: UA 随机化、Header 伪造、代理池轮换、速率限制、延迟扫描、连接池复用
+// 支持最多跟随 3 次重定向，跟随时保持原始 Host 头
 func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 	cfg := config.GetInstance()
 
@@ -788,11 +908,23 @@ func SendHTTPGetRequest(protocol, ip, host string) (*HttpCustomRequest, error) {
 	tp := GetTransportPool()
 	transport := tp.GetTransport(transportKey, cfg)
 
+	// 最大重定向跟随次数
+	const maxRedirects = 3
+
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(cfg.HTTP.ReadTimeout+cfg.HTTP.ConnectTimeout) * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
+			if len(via) >= maxRedirects {
+				// 超过最大重定向次数，停止跟随，返回最后一个响应
+				return http.ErrUseLastResponse
+			}
+			// 跟随重定向时保持原始 Host 头
+			// 这对 Host 碰撞场景很重要：重定向后仍然需要使用碰撞的 Host
+			if len(via) > 0 && via[0].Host != "" {
+				req.Host = via[0].Host
+			}
+			return nil
 		},
 	}
 

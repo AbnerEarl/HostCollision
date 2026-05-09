@@ -1220,16 +1220,25 @@ func (w *Worker) collision(
 		}
 	}
 
-	// ===== 直接请求 Host 比对：如果 Host 的 DNS 解析到的 IP 就是碰撞目标 IP，则不算隐形资产 =====
-	// 核心逻辑：隐形资产的定义是 "DNS 没有指向该 IP，但该 IP 上确实部署了该 Host 的服务"
-	// 因此只有当 Host 的 DNS 解析到了碰撞目标 IP 时，才说明这不是隐形资产
-	// 如果 Host 的 DNS 解析到了不同的 IP，即使响应内容相似，也应该保留（这正是隐形资产）
+	// ===== 直接请求 Host 比对：过滤"碰撞结果与直接访问Host结果一致"的误报 =====
+	// 核心思路：
+	// 1. 如果 Host 的 DNS 直接解析到了碰撞目标 IP → 不是隐形资产，直接过滤
+	// 2. 无论 DNS 解析结果如何，都要比对碰撞响应与直接请求 Host 的响应
+	//    如果两者高度相似，说明碰撞到的只是该 Host 的正常服务（可能是多IP部署/CDN回源），不是隐形资产
+
+	// 提取纯 IP（去掉端口号），用于与 DNS 解析结果比对
+	// 碰撞目标 IP 可能带端口号（如 "109.244.8.66:443"），而 DNS 解析返回纯 IP
+	pureIP := ip
+	if h, _, err := net.SplitHostPort(ip); err == nil {
+		pureIP = h
+	}
+
 	hostIPs, dnsErr := net.LookupHost(host)
 	if dnsErr == nil && len(hostIPs) > 0 {
-		// 检查 Host 的 DNS 解析结果是否包含碰撞目标 IP
+		// 检查 Host 的 DNS 解析结果是否包含碰撞目标 IP（使用纯IP比对）
 		hostResolvesToTargetIP := false
 		for _, resolvedIP := range hostIPs {
-			if resolvedIP == ip {
+			if resolvedIP == pureIP {
 				hostResolvesToTargetIP = true
 				break
 			}
@@ -1241,30 +1250,45 @@ func (w *Worker) collision(
 			}
 			return collisionResultFailed
 		}
-		// Host 的 DNS 解析到了不同的 IP，进一步比对响应内容
-		// 如果碰撞结果与直接请求 Host 的响应完全一致，说明可能是 CDN 分发的相同内容
-		hostDirectReq, hostDirectErr := httpclient.SendHTTPGetRequest(protocol, host, host)
-		if hostDirectErr == nil && hostDirectReq != nil {
-			// 条件1：状态码相同且内容完全一致 → 直接过滤
-			if hostDirectReq.StatusCode == newRequest.StatusCode &&
-				hostDirectReq.ContentLen == newRequest.ContentLen &&
-				hostDirectReq.AppBody() == newRequest.AppBody() {
+	}
+
+	// 无论 DNS 解析是否成功，都尝试直接请求 Host 进行响应比对
+	// 这是过滤误报的关键步骤：如果碰撞结果与直接访问 Host 的结果一致，则不是隐形资产
+	hostDirectReq, hostDirectErr := httpclient.SendHTTPGetRequest(protocol, host, host)
+	if hostDirectErr == nil && hostDirectReq != nil {
+		// 条件1：状态码相同且内容完全一致 → 直接过滤
+		if hostDirectReq.StatusCode == newRequest.StatusCode &&
+			hostDirectReq.ContentLen == newRequest.ContentLen &&
+			hostDirectReq.AppBody() == newRequest.AppBody() {
+			if w.outputErrorLog {
+				fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果完全一致,非隐形资产)\n", protocol, ip, host)
+			}
+			return collisionResultFailed
+		}
+
+		// 条件2：SimHash 相似度比对（不限制状态码必须相同）
+		// 动态页面可能有时间戳、CSRF token 等导致内容不完全一致，但 SimHash 可以识别
+		collisionSimhash := simhash(newRequest.FilteredPageContent())
+		directSimhash := simhash(hostDirectReq.FilteredPageContent())
+		if collisionSimhash != 0 && directSimhash != 0 && SimhashDistance(collisionSimhash, directSimhash) <= 3 {
+			if w.outputErrorLog {
+				fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果高度相似,SimHash海明距离≤3,非隐形资产)\n", protocol, ip, host)
+			}
+			return collisionResultFailed
+		}
+
+		// 条件3：编辑距离相似度比对（补充 SimHash 的不足）
+		// SimHash 对短文本或结构差异大但内容相似的页面可能不够敏感
+		// 使用编辑距离做更精确的相似度判断
+		if hostDirectReq.StatusCode == newRequest.StatusCode {
+			directBodyFormat := strings.ReplaceAll(hostDirectReq.AppBody(), host, "")
+			_, exceeded := diffpage.GetRatioWithThreshold(directBodyFormat, newBodyFormat, w.cfg.SimilarityRatio)
+			if exceeded {
 				if w.outputErrorLog {
-					fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果完全一致,非隐形资产)\n", protocol, ip, host)
+					fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果编辑距离相似度≥%.2f,非隐形资产)\n",
+						protocol, ip, host, w.cfg.SimilarityRatio)
 				}
 				return collisionResultFailed
-			}
-			// 条件2：状态码相同，Body 不完全一致（可能有动态内容如时间戳、token 等）
-			// 使用 SimHash 相似度比对，海明距离 ≤ 3 视为同一页面
-			if hostDirectReq.StatusCode == newRequest.StatusCode {
-				collisionSimhash := simhash(newRequest.FilteredPageContent())
-				directSimhash := simhash(hostDirectReq.FilteredPageContent())
-				if SimhashDistance(collisionSimhash, directSimhash) <= 3 {
-					if w.outputErrorLog {
-						fmt.Printf("协议:%s, ip:%s, host:%s 匹配失败-5(响应与直接请求Host结果高度相似,SimHash海明距离≤3,非隐形资产)\n", protocol, ip, host)
-					}
-					return collisionResultFailed
-				}
 			}
 		}
 	}
